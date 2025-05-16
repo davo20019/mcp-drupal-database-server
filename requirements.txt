@@ -1,0 +1,7 @@
+mcp
+mysql-connector-python
+psycopg2-binary
+# Add other dependencies as needed, e.g., a specific version for the mcp sdk if required 
+aiomysql
+pyodbc
+cx_Oracle 
