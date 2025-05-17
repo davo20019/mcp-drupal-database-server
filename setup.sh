@@ -13,18 +13,35 @@ check_python_version() {
         exit 1
     fi
 
-    # Get Python version string (e.g., "Python 3.9.5")
-    PYTHON_VERSION_STR=$(python3 --version 2>&1)
+    PYTHON_VERSION_FULL_STR=$(python3 --version 2>&1 | awk '{print $2}') # e.g., "3.12.10" or "3.9.5"
 
-    # Extract major and minor version numbers (e.g., "3.9" from "Python 3.9.5")
-    PYTHON_VERSION=$(echo "$PYTHON_VERSION_STR" | awk '{print $2}' | awk -F. '{print $1"."$2}')
+    # Extract major, minor, patch for current version
+    IFS='.' read -r py_major py_minor py_patch <<< "$PYTHON_VERSION_FULL_STR"
+    py_patch=${py_patch:-0} # Default patch to 0 if not present
 
-    # Compare versions
-    if ! awk -v ver="$PYTHON_VERSION" -v min_ver="$PYTHON_VERSION_MIN" 'BEGIN {exit !(ver >= min_ver)}'; then
-        echo "Error: Python version ${PYTHON_VERSION_MIN} or higher is required. You have ${PYTHON_VERSION_STR}." >&2
+    # Extract major, minor, patch for minimum required version
+    IFS='.' read -r min_major min_minor min_patch <<< "$PYTHON_VERSION_MIN"
+    min_patch=${min_patch:-0} # Default patch to 0 if not present
+
+    # Perform numeric comparison
+    if [ "$py_major" -lt "$min_major" ]; then
+        VERSION_CHECK_FAILED=true
+    elif [ "$py_major" -eq "$min_major" ]; then
+        if [ "$py_minor" -lt "$min_minor" ]; then
+            VERSION_CHECK_FAILED=true
+        elif [ "$py_minor" -eq "$min_minor" ]; then
+            if [ "$py_patch" -lt "$min_patch" ]; then
+                VERSION_CHECK_FAILED=true
+            fi
+        fi
+    fi
+
+    if [ "${VERSION_CHECK_FAILED:-false}" = true ]; then
+        echo "Error: Python version ${PYTHON_VERSION_MIN} or higher is required. You have Python ${PYTHON_VERSION_FULL_STR}." >&2
         exit 1
     fi
-    echo "Python version check passed: ${PYTHON_VERSION_STR}"
+    
+    echo "Python version check passed: Python ${PYTHON_VERSION_FULL_STR}"
 }
 
 VENV_DIR="venv"
