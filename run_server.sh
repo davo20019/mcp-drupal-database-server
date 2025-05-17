@@ -101,6 +101,6 @@ echo "  Host: ${SERVER_HOST}"
 echo "  Port: ${SERVER_PORT}"
 
 # Run the server
-python mcp_drupal_server.py --settings_file "${SETTINGS_FILE_PATH}" --host "${SERVER_HOST}" --port "${SERVER_PORT}"
+"${VENV_DIR}/bin/python" mcp_drupal_server.py --settings_file "${SETTINGS_FILE_PATH}" --host "${SERVER_HOST}" --port "${SERVER_PORT}"
 
 echo "Server stopped." 
