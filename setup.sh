@@ -4,7 +4,7 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-PYTHON_VERSION_MIN="3.8"
+PYTHON_VERSION_MIN="3.10"
 
 # Function to check Python version
 check_python_version() {
@@ -65,6 +65,10 @@ if [ -f "${VENV_DIR}/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "${VENV_DIR}/bin/activate"
     echo "Virtual environment activated. (Run 'deactivate' to exit)"
+
+    echo "Upgrading pip in virtual environment..."
+    pip install --upgrade pip
+    echo "pip upgraded."
 else
     echo "Error: Could not find activation script at ${VENV_DIR}/bin/activate." >&2
     echo "Please activate the virtual environment manually." >&2
