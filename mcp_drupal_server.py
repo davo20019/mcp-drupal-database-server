@@ -3,8 +3,8 @@ import logging
 import asyncio
 from typing import Optional, List, Dict, Any
 
-from model_context_protocol.server import ModelContextServer, Tool, tool
-from model_context_protocol.server_types import (    
+from mcp.server import ModelContextServer, Tool, tool
+from mcp.server_types import (    
     ToolCallContext,
     ToolCallRequest,
     ToolCallResponse,
