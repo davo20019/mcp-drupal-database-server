@@ -23,7 +23,7 @@ This project implements a Model Context Protocol (MCP) server that allows AI mod
 
 ## Prerequisites
 
-*   Python 3.8+
+*   Python 3.10+ (This is a requirement of the `mcp` package itself)
 *   Access to a Drupal site's `settings.php` file.
 *   A running Drupal database (MySQL or PostgreSQL) accessible from where the server will run.
 
