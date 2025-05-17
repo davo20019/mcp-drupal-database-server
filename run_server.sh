@@ -52,10 +52,21 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# Check if settings_file is provided
+# Check if settings_file is provided; if not, prompt interactively
 if [ -z "${SETTINGS_FILE_PATH}" ]; then
-    echo "Error: --settings_file is a required argument." >&2
-    usage
+    # Check if --help was the only argument or if no arguments were given.
+    # The 'usage' function exits, so if we are here, --help wasn't the sole cause of exit.
+    # However, we want to avoid prompting if --help was an arg among others but settings_file was missing.
+    # The original script structure handles '--help' by calling 'usage' which exits.
+    # So, if we reach here and SETTINGS_FILE_PATH is empty, it means --settings_file was truly missing.
+
+    echo "The --settings_file argument is required."
+    read -r -p "Please enter the path to your Drupal settings.php file: " SETTINGS_FILE_PATH
+
+    if [ -z "${SETTINGS_FILE_PATH}" ]; then
+        echo "Error: No path provided for settings.php. Exiting." >&2
+        exit 1
+    fi
 fi
 
 # Check if settings_file exists
