@@ -27,6 +27,34 @@ This project implements a Model Context Protocol (MCP) server that allows AI mod
 *   Access to a Drupal site's `settings.php` file.
 *   A running Drupal database (MySQL or PostgreSQL) accessible from where the server will run.
 
+### Installing Python 3.10+
+
+If the `setup.sh` script indicates that your Python version is too old (it requires 3.10 or newer for the `mcp` package), you will need to install an appropriate Python version. Here are some common ways to do this:
+
+*   **macOS (using Homebrew):**
+    ```bash
+    brew install python@3.10 # Or python@3.11, python@3.12
+    # Follow any post-install instructions from Homebrew.
+    # You might need to open a new terminal window after installation.
+    ```
+*   **Linux (Debian/Ubuntu-based):**
+    ```bash
+    sudo apt update
+    sudo apt install python3.10 # Or python3.11, python3.12
+    # For older Ubuntu versions or if the package isn't found, you might need the deadsnakes PPA:
+    # sudo add-apt-repository ppa:deadsnakes/ppa
+    # sudo apt update
+    # sudo apt install python3.10
+    ```
+*   **Linux (Fedora/CentOS/RHEL-based):**
+    ```bash
+    sudo dnf install python3.10 # Or python3.11, python3.12 (Package names may vary)
+    ```
+*   **From python.org:**
+    Download the official installer for your operating system from [https://www.python.org/downloads/](https://www.python.org/downloads/).
+
+After installing a newer Python version, ensure it's available in your system's PATH. You might need to open a new terminal session. Then, if you had a `./venv` directory from a previous attempt, remove it (`rm -rf ./venv`) before re-running the `./setup.sh` script.
+
 ## Setup
 
 1.  **Clone the repository (or create the files as listed above).**
