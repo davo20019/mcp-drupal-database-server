@@ -79,6 +79,8 @@ INFO:mcp_drupal_server:Press Ctrl+C to stop the server.
 
 ## Connecting an MCP Client (e.g., Claude, Cursor)
 
+**Important Note on Usage Context:** This MCP server is primarily designed and recommended for **local development environments** or for use within a **secure, trusted private network**. Exposing it directly to the public internet, especially without additional security layers (like a VPN, IP whitelisting, or an authentication proxy), is **not recommended** due to the direct database access it provides.
+
 For integrating this Drupal Database Server with an MCP client (like Claude, Cursor, or other AI tools), the recommended approach for local development or dedicated use is to configure the client to **manage the server process directly**. This typically involves telling the client how to execute the `run_server.sh` script. Alternatively, you can run the server independently and have the client connect to its URL.
 
 **1. Client-Managed Server (Recommended for Local/Dedicated Use):**
