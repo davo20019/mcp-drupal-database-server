@@ -251,7 +251,7 @@ class DBManager:
             elif driver == 'mssql': # Added for SQL Server
                 return [row['TABLE_NAME'] for row in results if isinstance(row, dict) and 'TABLE_NAME' in row]
             elif driver == 'oracle': # Added for Oracle
-                return [row['TABLE_NAME'] for row in results if isinstance(row, dict) and 'TABLE_NAME' in row] # Assuming 'TABLE_NAME' from cx_Oracle as dict key
+                return [row['table_name'].lower() for row in results if isinstance(row, dict) and 'table_name' in row] # Oracle names are often upper, standardize to lower
         return None
 
     def get_table_schema(self, table_name: str) -> Optional[Dict[str, str]]:
@@ -324,6 +324,149 @@ class DBManager:
             logger.error(f"Unsupported driver for get_table_schema: {driver}")
             return None
 
+    def prepare_query(self, query: str) -> str:
+        """Replaces {{table_name}} with the prefixed table name."""
+        prefix = self.db_config.get('prefix', '')
+        # Regex to find {{table_name}} occurrences
+        return query.replace('{', '{{').replace('}', '}}').replace('{{{{', '{{').replace('}}}}', '}}').format(**{table_name: prefix + table_name for table_name in self._extract_table_names(query)})
+
+    def _extract_table_names(self, query: str) -> List[str]:
+        """Helper to extract unique table names from {{table_name}} placeholders in a query."""
+        import re
+        # Matches {{table_name}} allowing for spaces around table_name
+        matches = re.findall(r"{\{\s*([a-zA-Z0-9_]+)\s*\}}", query)
+        return list(set(matches)) # Return unique table names
+
+    # New Drupal-specific methods for DBManager class:
+    def get_node_by_id(self, nid: int) -> Optional[Dict[str, Any]]:
+        """Fetches basic data for a specific node by its ID."""
+        query = self.prepare_query("""
+            SELECT 
+                nfd.nid, nfd.vid, nfd.type, nfd.langcode, nfd.status, nfd.uid, 
+                nfd.title, nfd.created, nfd.changed,
+                ufd.name AS author_name,
+                COALESCE(nb.body_value, nrb.body_value) AS body_value,
+                COALESCE(nb.body_summary, nrb.body_summary) AS body_summary,
+                COALESCE(nb.body_format, nrb.body_format) AS body_format
+            FROM 
+                {node_field_data} nfd
+            LEFT JOIN 
+                {users_field_data} ufd ON nfd.uid = ufd.uid
+            LEFT JOIN 
+                {node__body} nb ON nfd.nid = nb.entity_id AND nfd.vid = nb.revision_id AND nb.deleted = 0 AND nb.langcode = nfd.langcode
+            LEFT JOIN
+                {node_revision__body} nrb ON nfd.vid = nrb.revision_id AND nrb.deleted = 0 AND nrb.langcode = nfd.langcode
+            WHERE 
+                nfd.nid = %s
+        """)
+        return self.execute_query(query, (nid,), fetch_one=True)
+
+    def list_content_types(self) -> Optional[List[Dict[str, Any]]]:
+        """Lists all available content types (node types)."""
+        query = self.prepare_query("SELECT type, name, description FROM {node_type}")
+        return self.execute_query(query)
+
+    def get_taxonomy_term_by_id(self, tid: int) -> Optional[Dict[str, Any]]:
+        """Fetches data for a specific taxonomy term by its ID."""
+        query = self.prepare_query("""
+            SELECT 
+                tfd.tid, tfd.vid, tfd.name, tfd.description, tfd.langcode,
+                tv.name AS vocabulary_name
+            FROM 
+                {taxonomy_term_field_data} tfd
+            LEFT JOIN
+                {taxonomy_vocabulary} tv ON tfd.vid = tv.vid
+            WHERE 
+                tfd.tid = %s
+        """)
+        return self.execute_query(query, (tid,), fetch_one=True)
+
+    def list_vocabularies(self) -> Optional[List[Dict[str, Any]]]:
+        """Lists all taxonomy vocabularies."""
+        query = self.prepare_query("SELECT vid, name, description FROM {taxonomy_vocabulary}")
+        return self.execute_query(query)
+
+    def get_user_by_id(self, uid: int) -> Optional[Dict[str, Any]]:
+        """Fetches basic data for a specific user by ID."""
+        base_query_fields = """
+            ufd.uid, ufd.name, ufd.mail, ufd.status, ufd.created, ufd.changed, ufd.langcode
+        """
+        group_by_fields = """
+            ufd.uid, ufd.name, ufd.mail, ufd.status, ufd.created, ufd.changed, ufd.langcode
+        """
+        driver = self.db_config.get('driver')
+        roles_aggregation = ""
+
+        if driver == 'mysql':
+            roles_aggregation = "GROUP_CONCAT(DISTINCT ur.roles_target_id) as roles"
+        elif driver == 'pgsql':
+            roles_aggregation = "STRING_AGG(DISTINCT ur.roles_target_id, ',') as roles"
+        elif driver == 'mssql':
+            roles_aggregation = "STRING_AGG(ur.roles_target_id, ',') WITHIN GROUP (ORDER BY ur.roles_target_id) as roles"
+        elif driver == 'oracle':
+            roles_aggregation = "LISTAGG(ur.roles_target_id, ',') WITHIN GROUP (ORDER BY ur.roles_target_id) as roles"
+        else: 
+            roles_aggregation = "NULL as roles"
+
+        if roles_aggregation == "NULL as roles":
+            query = self.prepare_query(f"""
+                SELECT 
+                    {base_query_fields}
+                FROM 
+                    {{users_field_data}} ufd
+                WHERE 
+                    ufd.uid = %s
+            """)
+        else:
+            query = self.prepare_query(f"""
+                SELECT 
+                    {base_query_fields},
+                    {roles_aggregation}
+                FROM 
+                    {{users_field_data}} ufd
+                LEFT JOIN
+                    {{user__roles}} ur ON ufd.uid = ur.entity_id
+                WHERE 
+                    ufd.uid = %s
+                GROUP BY
+                    {group_by_fields}
+            """)
+        return self.execute_query(query, (uid,), fetch_one=True)
+
+    def list_paragraphs_by_node_id(self, nid: int, paragraph_field_name: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Lists paragraph entities referenced by a specific node via a given paragraph field.
+        """
+        node_paragraph_field_table = f"node__{paragraph_field_name}"
+        query = self.prepare_query(f"""
+            SELECT
+                p_ref.{paragraph_field_name}_target_id AS paragraph_id,
+                p_ref.{paragraph_field_name}_target_revision_id AS paragraph_revision_id,
+                pfd.id AS paragraph_item_id, 
+                pfd.type AS paragraph_type,
+                pfd.langcode AS paragraph_langcode,
+                pfd.status AS paragraph_status
+            FROM
+                {{{node_paragraph_field_table}}} p_ref
+            JOIN
+                {{paragraphs_item_field_data}} pfd ON p_ref.{paragraph_field_name}_target_id = pfd.id 
+                                            AND p_ref.{paragraph_field_name}_target_revision_id = pfd.revision_id
+            WHERE
+                p_ref.entity_id = %s AND p_ref.deleted = 0
+            ORDER BY
+                p_ref.delta ASC
+        """)
+        logger.info(f"Executing paragraph query for node {nid}, field {paragraph_field_name} with prepared query: {{query}}")
+        try:
+            results = self.execute_query(query, (nid,))
+            if results is None:
+                logger.warning(f"Paragraph query for node {nid}, field {paragraph_field_name} returned None.")
+            return results
+        except Exception as e:
+            logger.error(f"Error in list_paragraphs_by_node_id for nid {nid}, field {paragraph_field_name}: {e}")
+            logger.error(f"Problematic query was: {{query}}")
+            return None
+
 # Example Usage (for testing purposes, typically this class would be used by the MCP server)
 if __name__ == '__main__':
     import os
@@ -365,6 +508,7 @@ if __name__ == '__main__':
 
     print("--- Testing MySQL Connection (requires a running MySQL server with credentials above) ---")
     mysql_config = parse_settings_php(mysql_test_file)
+    db_manager_mysql = None # Initialize to ensure it's in scope for finally
     if mysql_config:
         print(f"MySQL Config: {mysql_config}")
         try:
@@ -387,27 +531,39 @@ if __name__ == '__main__':
             print(f"MySQL Query Result for example_name: {query_result_mysql}")
             assert query_result_mysql and query_result_mysql['value'] == 'example_value'
 
-            db_manager_mysql.close()
+            # Test Drupal specific methods for MySQL
+            print("\n--- Testing Drupal Specific Methods (MySQL) ---")
+            # These will likely fail unless you have Drupal tables like 'dr_node_type', etc.
+            # For this test script, it's more about ensuring the methods run without Python errors.
+            try:
+                content_types = db_manager_mysql.list_content_types()
+                print(f"MySQL - Content Types: {content_types}")
+                node_data = db_manager_mysql.get_node_by_id(1)
+                print(f"MySQL - Node ID 1: {node_data}")
+                # Add more calls if needed, e.g., for users, taxonomies
+            except Exception as specific_e:
+                print(f"MySQL - Error testing Drupal specific methods (expected if Drupal tables don't exist): {specific_e}")
+
         except ConnectionError as e:
             print(f"MySQL connection/test failed: {e}. Please ensure MySQL is running and configured as per dummy_settings_mysql.php")
         except Exception as e:
             print(f"An error occurred during MySQL tests: {e}")
+        finally:
+            if db_manager_mysql:
+                db_manager_mysql.close()
     else:
         print("Failed to parse MySQL dummy settings.")
 
-    # PostgreSQL testing requires a running PostgreSQL server and a pre-existing database and user.
-    # The `parse_settings_php` and `DBManager` are designed to work with it.
-    # To fully test, you would need to setup a PostgreSQL instance similar to MySQL above.
+    # PostgreSQL testing 
     print("\n--- Testing PostgreSQL Connection (requires a running PostgreSQL server and test_drupal_db_pg database/user) ---")
     pgsql_config = parse_settings_php(pgsql_test_file)
+    db_manager_pgsql = None # Initialize for finally block
     if pgsql_config:
         print(f"PostgreSQL Config: {pgsql_config}")
         try:
             db_manager_pgsql = DBManager(pgsql_config)
             table_name_pgsql = pgsql_config.get('prefix', '') + 'test_table_pg'
-            # Note: For PostgreSQL, table and column names are case-sensitive if quoted.
-            # Standard SQL practice is often unquoted, lowercase names.
-            db_manager_pgsql.execute_query(f'DROP TABLE IF EXISTS "{table_name_pgsql}" cascade') # Use double quotes for pgsql if needed
+            db_manager_pgsql.execute_query(f'DROP TABLE IF EXISTS "{table_name_pgsql}" cascade') 
             db_manager_pgsql.execute_query(f'CREATE TABLE "{table_name_pgsql}" (id SERIAL PRIMARY KEY, name VARCHAR(255), value TEXT)')
             db_manager_pgsql.execute_query(f'INSERT INTO "{table_name_pgsql}" (name, value) VALUES (%s, %s)', ('pg_example', 'pg_value'))
 
@@ -415,20 +571,31 @@ if __name__ == '__main__':
             print(f"PostgreSQL Tables: {tables_pgsql}")
             if tables_pgsql and table_name_pgsql in tables_pgsql:
                  print(f"Successfully found {table_name_pgsql} in PostgreSQL tables.")
-                 schema_pgsql = db_manager_pgsql.get_table_schema('test_table_pg') # Use unprefixed name
+                 schema_pgsql = db_manager_pgsql.get_table_schema('test_table_pg') 
                  print(f"PostgreSQL Schema for {table_name_pgsql}: {schema_pgsql}")
                  assert schema_pgsql and 'id' in schema_pgsql and 'name' in schema_pgsql
 
             query_result_pgsql = db_manager_pgsql.execute_query(f'SELECT * FROM "{table_name_pgsql}" WHERE name = %s', ('pg_example',), fetch_one=True)
             print(f"PostgreSQL Query Result for pg_example: {query_result_pgsql}")
             assert query_result_pgsql and query_result_pgsql['value'] == 'pg_value'
+            
+            # Test Drupal specific methods for PostgreSQL
+            print("\n--- Testing Drupal Specific Methods (PostgreSQL) ---")
+            try:
+                content_types_pg = db_manager_pgsql.list_content_types()
+                print(f"PostgreSQL - Content Types: {content_types_pg}")
+                node_data_pg = db_manager_pgsql.get_node_by_id(1)
+                print(f"PostgreSQL - Node ID 1: {node_data_pg}")
+            except Exception as specific_e_pg:
+                print(f"PostgreSQL - Error testing Drupal specific methods (expected if Drupal tables don't exist): {specific_e_pg}")
 
-            db_manager_pgsql.close()
         except ConnectionError as e:
             print(f"PostgreSQL connection/test failed: {e}. Please ensure PostgreSQL is running, database '{pgsql_config.get('database')}' exists, and user is configured as per dummy_settings_pgsql.php")
         except Exception as e:
             print(f"An error occurred during PostgreSQL tests: {e}")
-
+        finally:
+            if db_manager_pgsql:
+                db_manager_pgsql.close()
     else:
         print("Failed to parse PostgreSQL dummy settings.")
 

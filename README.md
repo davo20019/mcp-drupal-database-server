@@ -195,6 +195,71 @@ A client like Claude or Cursor, if configured to use this MCP server, might make
 
 The tool will return a JSON response containing the requested information or an error message.
 
+## New Drupal-Specific Tools
+
+In addition to the general `drupal_database_query` tool, the server now offers more specific, higher-level tools for common Drupal entities:
+
+**1. List Content Types**
+*   **Tool Name:** `drupal_list_content_types`
+*   **Description:** Lists all available Drupal content types (node types).
+*   **Parameters:** None
+*   **Returns:** A JSON list of content type objects, each containing `type`, `name`, and `description`.
+
+**2. Get Node by ID**
+*   **Tool Name:** `drupal_get_node_by_id`
+*   **Description:** Fetches detailed information for a specific Drupal node by its ID.
+*   **Parameters:**
+    *   `nid` (integer, required): The Node ID.
+*   **Returns:** A JSON object containing node data (e.g., `nid`, `vid`, `type`, `title`, `status`, `created`, `changed`, `uid`, `author_name`, `body_value`, etc.) or an error if not found.
+
+**3. List Vocabularies**
+*   **Tool Name:** `drupal_list_vocabularies`
+*   **Description:** Lists all taxonomy vocabularies in Drupal.
+*   **Parameters:** None
+*   **Returns:** A JSON list of vocabulary objects, each containing `vid`, `name`, and `description`.
+
+**4. Get Taxonomy Term by ID**
+*   **Tool Name:** `drupal_get_taxonomy_term_by_id`
+*   **Description:** Fetches detailed information for a specific taxonomy term by its ID.
+*   **Parameters:**
+    *   `tid` (integer, required): The Taxonomy Term ID.
+*   **Returns:** A JSON object containing term data (e.g., `tid`, `vid`, `name`, `description`, `vocabulary_name`) or an error if not found.
+
+**5. Get User by ID**
+*   **Tool Name:** `drupal_get_user_by_id`
+*   **Description:** Fetches detailed information for a specific Drupal user by their ID.
+*   **Parameters:**
+    *   `uid` (integer, required): The User ID.
+*   **Returns:** A JSON object containing user data (e.g., `uid`, `name`, `mail`, `status`, `created`, `changed`, `roles`) or an error if not found.
+
+**6. List Paragraphs by Node ID**
+*   **Tool Name:** `drupal_list_paragraphs_by_node_id`
+*   **Description:** Lists paragraph items referenced by a specific node through a given paragraph field. The query attempts to find paragraphs based on common Drupal conventions for paragraph field naming (e.g., `node__field_machine_name` for the reference field on the node, and `paragraphs_item_field_data` for the main paragraph data). 
+*   **Parameters:**
+    *   `nid` (integer, required): The Node ID that contains the paragraphs.
+    *   `paragraph_field_name` (string, required): The machine name of the paragraph reference field on the node (e.g., `field_body_paragraphs`, `field_components`).
+*   **Returns:** A JSON list of paragraph objects, each containing details like `paragraph_id`, `paragraph_revision_id`, `paragraph_type`, etc., or an error. *Note: The reliability of this tool depends heavily on the specific paragraph setup and field naming conventions of the target Drupal site. It might require adjustments in `db_manager.py` for complex or non-standard configurations.*
+
+**Example MCP Client Interaction (Conceptual for new tools):**
+
+*To list content types:*
+```json
+{
+  "tool_name": "drupal_list_content_types",
+  "parameters": {}
+}
+```
+
+*To get node with ID 123:*
+```json
+{
+  "tool_name": "drupal_get_node_by_id",
+  "parameters": {
+    "nid": 123
+  }
+}
+```
+
 ## Security Considerations
 
 *   **`settings.php` Path**: Ensure the path to `settings.php` is correct and the file is readable by the user running the server.
