@@ -3,9 +3,37 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def parse_php_value(value_str: str, variables: dict) -> any:
+    """Converts a PHP value string (possibly a variable) to a Python type."""
+    value_str = value_str.strip()
+    # Check if it's a string literal
+    if (value_str.startswith("'") and value_str.endswith("'")) or \
+       (value_str.startswith('"') and value_str.endswith('"')):
+        return value_str[1:-1]
+    # Check if it's a known variable
+    if value_str.startswith("$") and value_str[1:] in variables:
+        return variables[value_str[1:]]
+    # Check if it's a number
+    if value_str.isdigit():
+        return int(value_str)
+    # Check for boolean/null literals (case-insensitive)
+    if value_str.lower() == 'true':
+        return True
+    if value_str.lower() == 'false':
+        return False
+    if value_str.lower() == 'null':
+        return None
+    # Otherwise, it might be an unquoted string or constant we don't handle
+    # For this parser, we'll assume it's a string if not a recognized variable or number.
+    # This might need refinement for other PHP constants.
+    logger.debug(f"Unrecognized PHP value type for '{value_str}', treating as raw string or unparsed variable.")
+    return value_str # Fallback: return as is, or could raise error/return None
+
 def parse_settings_php(file_path: str) -> dict | None:
     """
     Parses a Drupal settings.php file to extract database connection details.
+    Handles both direct array assignment and individual key assignments for $databases['default']['default'].
+    Also handles simple variable substitutions for host, port, driver.
 
     Args:
         file_path: The absolute path to the settings.php file.
@@ -25,193 +53,188 @@ def parse_settings_php(file_path: str) -> dict | None:
         logger.error(f"Error reading settings.php file at {file_path}: {e}")
         return None
 
-    # More robust regex to find the $databases['default']['default'] array
-    # This regex looks for the assignment and captures the content within the array definition.
-    # It handles single and double quotes for keys and values.
-    # It's designed to be non-greedy and capture the innermost relevant array.
+    config = {}
+    variables = {}
+
+    # 1. Parse simple variable assignments like $host = "db";
+    var_pattern = re.compile(r"^\s*\$(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?P<value>[^;]+);", re.MULTILINE)
+    for match in var_pattern.finditer(content):
+        var_name = match.group("name")
+        raw_value = match.group("value").strip()
+        # For variables, we only parse simple string or numeric literals directly for now
+        if (raw_value.startswith("'") and raw_value.endswith("'")) or \
+           (raw_value.startswith('"') and raw_value.endswith('"')):
+            variables[var_name] = raw_value[1:-1]
+        elif raw_value.isdigit():
+            variables[var_name] = int(raw_value)
+        else:
+            # Could be a more complex expression or constant, log and skip for now for simplicity
+            logger.debug(f"Skipping complex variable assignment for ${var_name}: {raw_value}")
+    
+    logger.debug(f"Parsed variables: {variables} from {file_path}")
+
+    # 2. Try to find the full $databases['default']['default'] array assignment first
     db_settings_match = re.search(
-        r"\$databases\s*\[\s*['\"]default['\"]\s*\]\s*\[\s*['\"]default['\"]\s*\]\s*=\s*(array\(|\[)(.*?)(\)|\])\s*;",
+        r"\$databases\s*\[\s*['\"]default['\"]\s*\]\s*\[\s*['\"]default['\"]\s*\]\s*=\s*(array\(|\[)(.*?)(\)|])\s*;",
         content,
         re.DOTALL | re.IGNORECASE
     )
 
-    if not db_settings_match:
-        logger.warning(f"Could not find the default database settings in {file_path}. "
-                       "Ensure \$databases['default']['default'] is defined.")
+    if db_settings_match:
+        logger.info(f"Found $databases['default']['default'] as a full array in {file_path}")
+        settings_str = db_settings_match.group(2) # Content within the array(...) or [...]
+        
+        # Regex for key-value pairs within the array string
+        # Handles 'key' => 'value', "key" => "value", 'key' => $variable, 'key' => 123
+        pair_pattern = re.compile(
+            r"['\"](?P<key>\w+)['\"]\s*=>\s*(?P<value>[^,)\]]+)"
+        )
+        for match in pair_pattern.finditer(settings_str):
+            key = match.group('key')
+            val_str = match.group('value').strip()
+            if key in ['driver', 'database', 'username', 'password', 'host', 'port', 'prefix']:
+                config[key] = parse_php_value(val_str, variables)
+    else:
+        logger.info(f"Did not find full array assignment for $databases['default']['default'] in {file_path}. "
+                       "Attempting to parse individual assignments.")
+        # 3. If full array not found, try to parse individual assignments
+        # $databases['default']['default']['key'] = 'value';
+        # $databases['default']['default']['key'] = $variable;
+        individual_assignment_pattern = re.compile(
+            r"\$databases\s*\[\s*['\"]default['\"]\s*\]\s*\[\s*['\"]default['\"]\s*\]\s*\[\s*['\"](?P<key>\w+)['\"]\s*\]\s*=\s*(?P<value>[^;]+);",
+            re.IGNORECASE
+        )
+        for match in individual_assignment_pattern.finditer(content):
+            key = match.group('key')
+            val_str = match.group('value').strip()
+            if key in ['driver', 'database', 'username', 'password', 'host', 'port', 'prefix']:
+                config[key] = parse_php_value(val_str, variables)
+                logger.debug(f"Parsed individual assignment: config['{key}'] = {config[key]}")
+
+
+    if not config:
+        logger.warning(f"Could not extract any database settings from {file_path}. "
+                       "Ensure $databases['default']['default'] is defined using a supported format.")
         return None
-
-    settings_str = db_settings_match.group(2) # Content within the array(...) or [...]
-
-    config = {}
-    # Regex to find key-value pairs within the captured settings string.
-    # Handles 'key' => 'value', "key" => "value", 'key' => "value", "key" => 'value'
-    # Also handles numeric values for port if not quoted.
-    # Improved to handle comments and ensure correct pairing.
-    pattern = re.compile(
-        r"['\"](?P<key>\w+)['\"]\s*=>\s*(?:['\"](?P<value_str>[^'\"]*)['\"]|(?P<value_num>\d+))"
-    )
-    
-    for match in pattern.finditer(settings_str):
-        key = match.group('key')
-        value = match.group('value_str') if match.group('value_str') is not None else match.group('value_num')
-        if key in ['driver', 'database', 'username', 'password', 'host', 'port', 'prefix']:
-            config[key] = value
             
     # Ensure essential keys are present
     required_keys = ['driver', 'database', 'username', 'password', 'host']
-    if not all(key in config for key in required_keys):
-        logger.warning(f"Missing some required database configuration keys in {file_path}. "
-                       f"Found: {config.keys()}. Required: {required_keys}")
+    missing_keys = [key for key in required_keys if key not in config or config[key] is None]
+    
+    if missing_keys:
+        logger.warning(f"Missing some required database configuration keys in {file_path} after parsing. "
+                       f"Found: {config}. Missing: {missing_keys}")
         # Attempt to provide defaults if reasonable (e.g. port)
-        if 'port' not in config:
+        if 'port' not in config or config.get('port') is None:
             if config.get('driver') == 'mysql':
-                config['port'] = '3306'
+                config['port'] = '3306' # Default as string, will be int-converted later
             elif config.get('driver') == 'pgsql':
                 config['port'] = '5432'
-        # Re-check after potential defaults
-        if not all(key in config for key in required_keys):
-             logger.error(f"Still missing required keys after attempting to set defaults. Cannot proceed.")
+            if 'port' in missing_keys and 'port' in config : # If port was missing and now set
+                 missing_keys.remove('port')
+
+
+        if missing_keys: # Re-check after potential defaults
+             logger.error(f"Still missing required keys {missing_keys} after attempting to set defaults. Cannot proceed.")
              return None
 
-
-    if 'prefix' not in config: # Prefix can be an empty string or an array. We handle simple string prefix.
+    if 'prefix' not in config:
         config['prefix'] = '' 
-        # If prefix is an array (e.g. for different table types), this simple parser will not capture it correctly.
-        # Advanced parsing for array prefixes might be needed for complex Drupal setups.
-        prefix_array_match = re.search(r"['\"]prefix['\"]\s*=>\s*(array\(|\[)(.*?)(\)|\])", settings_str, re.DOTALL | re.IGNORECASE)
-        if prefix_array_match:
-            logger.warning("An array table prefix is defined in settings.php. This parser only supports a single string prefix. Operations might be affected for tables using non-default prefixes.")
-            # Try to get the 'default' prefix if it's an array
-            default_prefix_match = re.search(r"['\"]default['\"]\s*=>\s*['\"]([^'\"]*)['\"]", prefix_array_match.group(2))
-            if default_prefix_match:
-                config['prefix'] = default_prefix_match.group(1)
-            else: # If no 'default' key, we cannot reliably get a single prefix.
-                 config['prefix'] = '' # Fallback to empty
-                 logger.warning("Could not determine a 'default' table prefix from the prefix array. Using empty prefix.")
-
-
-    # Convert port to int if it was parsed as a string
-    if 'port' in config and isinstance(config['port'], str):
+        if db_settings_match: # Only try complex prefix parsing if we had a full array
+            settings_str = db_settings_match.group(2)
+            prefix_array_match = re.search(r"['\"]prefix['\"]\s*=>\s*(array\(|\[)(.*?)(\)|])", settings_str, re.DOTALL | re.IGNORECASE)
+            if prefix_array_match:
+                logger.warning("An array table prefix is defined in settings.php. This parser only supports a single string prefix. Operations might be affected for tables using non-default prefixes.")
+                default_prefix_match = re.search(r"['\"]default['\"]\s*=>\s*['\"]([^'\"]*)['\"]", prefix_array_match.group(2))
+                if default_prefix_match:
+                    config['prefix'] = default_prefix_match.group(1)
+                else:
+                     config['prefix'] = ''
+                     logger.warning("Could not determine a 'default' table prefix from the prefix array. Using empty prefix.")
+    
+    # Convert port to int if it was parsed as a string or int
+    if 'port' in config:
         try:
-            config['port'] = int(config['port'])
+            config['port'] = int(str(config['port'])) # Ensure it's string first then int
         except ValueError:
             logger.error(f"Invalid port number: {config['port']}. It must be an integer.")
             return None
             
-    logger.info(f"Successfully parsed database configuration from {file_path}")
+    logger.info(f"Successfully parsed database configuration from {file_path}: {config}")
     return config
 
 if __name__ == '__main__':
     # Example usage:
-    # Create a dummy settings.php for testing
+    logging.basicConfig(level=logging.DEBUG) # Use DEBUG for testing parser
+
+    # Test DDEV-style settings
+    ddev_style_content = """<?php
+$host = "db_from_var";
+$port = 3306; // numeric
+$driver = "mysql_from_var";
+
+$databases['default']['default']['database'] = "db_ddev";
+$databases['default']['default']['username'] = "user_ddev";
+$databases['default']['default']['password'] = "pass_ddev";
+$databases['default']['default']['host'] = $host;
+$databases['default']['default']['port'] = $port;
+$databases['default']['default']['driver'] = $driver;
+$databases['default']['default']['prefix'] = ""; // empty prefix
+"""
+    test_file_ddev = "dummy_ddev_settings.php"
+    with open(test_file_ddev, "w", encoding="utf-8") as f:
+        f.write(ddev_style_content)
+    
+    print("\n--- Testing DDEV Style ---")
+    parsed_config_ddev = parse_settings_php(test_file_ddev)
+    if parsed_config_ddev:
+        print("Parsed DDEV Config:", parsed_config_ddev)
+        assert parsed_config_ddev['database'] == 'db_ddev'
+        assert parsed_config_ddev['username'] == 'user_ddev'
+        assert parsed_config_ddev['password'] == 'pass_ddev'
+        assert parsed_config_ddev['host'] == 'db_from_var' # Substituted from variable
+        assert parsed_config_ddev['port'] == 3306         # Substituted and int
+        assert parsed_config_ddev['driver'] == 'mysql_from_var'
+        assert parsed_config_ddev['prefix'] == ''
+
+
+    # Test standard array style settings
     dummy_settings_content = """<?php
 // ... some comments ...
 $databases['default']['default'] = [
   'database' => 'drupal_db',
   'username' => 'drupal_user',
   'password' => 'secret_password',
-  'prefix' => '',
-  'host' => 'localhost',
-  'port' => '3306',
-  'namespace' => 'Drupal\\Core\\Database\\Driver\\mysql',
-  'driver' => 'mysql',
-];
-
-// Test with single quotes and array() syntax
-$databases['default']['another'] = array(
-  'database' => 'another_db',
-  'username' => 'another_user',
-  'password' => 'another_pass',
-  'host' => '127.0.0.1',
-  'driver' => 'pgsql',
-  'port' => 5432, // Numeric port
-);
-
-// Test with more complex prefix
-$databases['default']['complex_prefix'] = [
-  'database' => 'drupal_db_complex',
-  'username' => 'user_complex',
-  'password' => 'pass_complex',
-  'prefix' => [
-    'default'   => 'main_',
-    'users'     => 'users_',
-    'node'      => 'content_',
-  ],
-  'host' => 'db.example.com',
-  'port' => '3307',
-  'driver' => 'mysql',
+  'prefix' => 'main_',
+  'host' => 'localhost_array',
+  'port' => '3307', // string port
+  'namespace' => 'Drupal\\\\Core\\\\Database\\\\Driver\\\\mysql',
+  'driver' => 'mysql_array',
 ];
 """
-    test_file_path = "dummy_settings.php"
-    with open(test_file_path, "w", encoding="utf-8") as f:
+    test_file_array = "dummy_array_settings.php"
+    with open(test_file_array, "w", encoding="utf-8") as f:
         f.write(dummy_settings_content)
 
-    logging.basicConfig(level=logging.INFO)
-    
-    # Test with the standard structure
-    parsed_config = parse_settings_php(test_file_path)
-    if parsed_config:
-        print("Parsed Config (standard):", parsed_config)
-        assert parsed_config['database'] == 'drupal_db'
-        assert parsed_config['username'] == 'drupal_user'
-        assert parsed_config['password'] == 'secret_password'
-        assert parsed_config['host'] == 'localhost'
-        assert parsed_config['port'] == 3306
-        assert parsed_config['driver'] == 'mysql'
-        assert parsed_config['prefix'] == ''
+    print("\n--- Testing Array Style ---")
+    parsed_config_array = parse_settings_php(test_file_array)
+    if parsed_config_array:
+        print("Parsed Array Config:", parsed_config_array)
+        assert parsed_config_array['database'] == 'drupal_db'
+        assert parsed_config_array['username'] == 'drupal_user'
+        assert parsed_config_array['password'] == 'secret_password'
+        assert parsed_config_array['host'] == 'localhost_array'
+        assert parsed_config_array['port'] == 3307
+        assert parsed_config_array['driver'] == 'mysql_array'
+        assert parsed_config_array['prefix'] == 'main_'
 
-    # To test the other configurations, you'd modify the dummy_settings_content
-    # or have multiple dummy files and call parse_settings_php on each.
-    # For example, to test 'another_db':
-    # You'd need to change the $databases['default']['default'] line in the dummy file
-    # to point to the 'another' configuration or temporarily rename 'another' to 'default'.
-    # The current parser specifically looks for $databases['default']['default'].
-
-    # Test complex prefix (current parser gets 'main_')
-    dummy_settings_content_complex = dummy_settings_content.replace(
-        "$databases['default']['default'] = [", 
-        "$databases['default']['default'] = ["
-    ).replace(
-        """'database' => 'drupal_db',
-  'username' => 'drupal_user',
-  'password' => 'secret_password',
-  'prefix' => '',
-  'host' => 'localhost',
-  'port' => '3306',
-  'namespace' => 'Drupal\\\\Core\\\\Database\\\\Driver\\\\mysql',
-  'driver' => 'mysql',
-];""",
-        """'database' => 'drupal_db_complex',
-  'username' => 'user_complex',
-  'password' => 'pass_complex',
-  'prefix' => [
-    'default'   => 'main_',
-    'users'     => 'users_',
-    'node'      => 'content_',
-  ],
-  'host' => 'db.example.com',
-  'port' => '3307',
-  'driver' => 'mysql',
-];"""
-    )
-    test_file_path_complex = "dummy_settings_complex.php"
-    with open(test_file_path_complex, "w", encoding="utf-8") as f:
-        f.write(dummy_settings_content_complex)
-    
-    parsed_config_complex = parse_settings_php(test_file_path_complex)
-    if parsed_config_complex:
-        print("Parsed Config (complex prefix):", parsed_config_complex)
-        assert parsed_config_complex['database'] == 'drupal_db_complex'
-        assert parsed_config_complex['host'] == 'db.example.com'
-        assert parsed_config_complex['port'] == 3307
-        assert parsed_config_complex['prefix'] == 'main_' # Correctly extracts 'default' from prefix array
 
     # Test file not found
-    print("\\nTesting non-existent file:")
+    print("\n--- Testing non-existent file ---")
     parse_settings_php("non_existent_settings.php")
 
     # Clean up dummy files
     import os
-    os.remove(test_file_path)
-    os.remove(test_file_path_complex)
-    print("\\nCleaned up dummy files.") 
+    os.remove(test_file_ddev)
+    os.remove(test_file_array)
+    print("\nCleaned up dummy files.") 

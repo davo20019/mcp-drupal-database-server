@@ -78,93 +78,106 @@ After installing a newer Python version, ensure it's available in your system's 
 
 ## Running the Server
 
-Once setup is complete and the virtual environment is active, execute the `mcp_drupal_server.py` script, providing the path to your Drupal site's `settings.php` file:
+Once setup is complete and the virtual environment is active, you can run the server.
 
+**For client integration (e.g., Windsurf, Claude for Desktop):**
+
+The server is primarily designed to be launched by an MCP client using `stdio` (standard input/output) transport. The client will execute the `mcp_drupal_server.py` script directly.
+Example client configuration (conceptual):
+```json
+{
+  "mcpServers": {
+    "drupal_db_server": {
+      "command": "python", // Or path to venv python
+      "args": [
+        "/full/path/to/your/mcp-drupal-database-server/mcp_drupal_server.py",
+        "--settings_file", "/path/to/your/drupal/sites/default/settings.php"
+        // Add other necessary args like --db-host, --db-port if overriding DDEV/settings.php
+      ],
+      "env": {
+        // Or set MCP_DRUPAL_SETTINGS_FILE here
+        // "MCP_DRUPAL_SETTINGS_FILE": "/path/to/your/drupal/sites/default/settings.php"
+      }
+    }
+  }
+}
+```
+In this mode, the `--host` and `--port` arguments for the MCP server itself are not used, as communication happens over stdio.
+
+**For direct execution (e.g., testing, or if you want an HTTP server):**
+
+You can still use the `run_server.sh` script, which can run the server over HTTP:
 ```bash
-python mcp_drupal_server.py --settings_file /path/to/your/drupal/sites/default/settings.php
+./run_server.sh --settings_file /path/to/your/drupal/sites/default/settings.php --host 127.0.0.1 --port 6789
 ```
+This script internally calls `python mcp_drupal_server.py` and can pass along `--host` and `--port` if you have modified `mcp_drupal_server.py` to handle them for HTTP mode (currently it defaults to stdio). The `run_server.sh` script itself still accepts `--host` and `--port` and would need to be adapted if you intend to use it to launch the Python script in HTTP mode.
+*As of the latest changes, `mcp_drupal_server.py` itself has been streamlined for `stdio` and does not accept `--host` or `--port` for its own MCP transport. The `run_server.sh` script's ability to pass these is for its own interface; how it then translates these to the Python script would require `mcp_drupal_server.py` to re-introduce HTTP transport options.*
 
-Alternatively, you can use the `run_server.sh` script (ensure it's executable: `chmod +x run_server.sh`):
+**Using `mcp dev` for local development:**
+
+The server is also compatible with the `mcp dev` tool for easier local development and testing:
 ```bash
-./run_server.sh --settings_file /path/to/your/drupal/sites/default/settings.php
+MCP_DRUPAL_SETTINGS_FILE="/path/to/your/drupal/sites/default/settings.php" ./venv/bin/mcp dev -e . mcp_drupal_server.py
 ```
-This script will also attempt to activate the virtual environment if it's not already active and accepts `--host` and `--port` arguments.
+This requires the `MCP_DRUPAL_SETTINGS_FILE` environment variable to be set, or you can pass `--settings_file` as an argument if `mcp dev` forwards extra arguments to the script. The `FastMCP` instance is defined globally in `mcp_drupal_server.py` for compatibility with `mcp dev`.
 
-**Command-line arguments (for both `mcp_drupal_server.py` and `run_server.sh`):**
+**Command-line arguments (for `mcp_drupal_server.py` when run by a client or `mcp dev`):**
 
-*   `--settings_file` (required): Absolute or relative path to the Drupal `settings.php` file.
-*   `--host` (optional): Host address for the MCP server to listen on. Defaults to `127.0.0.1`.
-*   `--port` (optional): Port for the MCP server. Defaults to `6789`.
+*   `--settings_file` (required if `MCP_DRUPAL_SETTINGS_FILE` env var is not set): Absolute or relative path to the Drupal `settings.php` file.
+*   `--db-host` (optional): Override the database host (e.g., for DDEV if detection fails or is not used).
+*   `--db-port` (optional): Override the database port.
 
-Upon successful startup, you should see log messages indicating the server is running and ready to accept connections, for example:
-
+Upon successful startup via a client, you should see tools appear in the client. If run directly with `mcp dev` or in a way that logs to console, you'll see messages like:
 ```
-INFO:mcp_drupal_server:Starting MCP Drupal Database Server on 127.0.0.1:6789
+INFO:mcp_drupal_server:Starting MCP Drupal Database Server with stdio transport.
 INFO:mcp_drupal_server:Registered tool: drupal_database_query
-INFO:mcp_drupal_server:Server is ready to accept connections from MCP clients.
-INFO:mcp_drupal_server:Press Ctrl+C to stop the server.
+... (other tools) ...
+INFO:mcp_drupal_server:Server is ready to accept connections from MCP clients via stdio.
 ```
 
 ## Connecting an MCP Client (e.g., Claude, Cursor)
 
-**Important Note on Usage Context:** This MCP server is primarily designed and recommended for **local development environments** or for use within a **secure, trusted private network**. Exposing it directly to the public internet, especially without additional security layers (like a VPN, IP whitelisting, or an authentication proxy), is **not recommended** due to the direct database access it provides.
+**Important Note on Usage Context:** This MCP server is primarily designed and recommended for **local development environments** or for use within a **secure, trusted private network**.
 
-For integrating this Drupal Database Server with an MCP client (like Claude, Cursor, or other AI tools), the recommended approach for local development or dedicated use is to configure the client to **manage the server process directly**. This typically involves telling the client how to execute the `run_server.sh` script. Alternatively, you can run the server independently and have the client connect to its URL.
+The primary method for connecting this server to an MCP client (like Windsurf, Claude for Desktop, Cursor) is by having the **client manage the server process directly using `stdio` transport.**
 
-**1. Client-Managed Server (Recommended for Local/Dedicated Use):**
+**Client-Managed Server via STDIO (Recommended):**
 
-In this setup, the MCP client is responsible for launching and managing the lifecycle of the `mcp_drupal_server.py` process, typically using the `run_server.sh` script. This is similar to the Firebase server example you mentioned.
+In this setup, the MCP client is responsible for launching and managing the lifecycle of the `mcp_drupal_server.py` process.
 
-*Example Client Configuration (for a client that manages the server process):*
-
-If your client supports launching local MCP servers, the configuration might look like this (syntax will vary by client):
+*Example Client Configuration (for a client that manages the server process, e.g., in a `claude_desktop_config.json` or similar):*
 
 ```json
 {
   "mcpServers": {
-    "mcp_drupal_db_server": {
-      "description": "MCP Drupal Database Server (Client-Managed)",
-      "command": "/full/path/to/your/mcp-drupal-database-server/run_server.sh",
+    "drupal_db_server": { // A unique name for your server instance
+      "description": "MCP Drupal Database Server",
+      "command": "/full/path/to/your/venv/bin/python", // Or just "python" if venv is active for client
       "args": [
+        "/full/path/to/your/mcp-drupal-database-server/mcp_drupal_server.py",
         "--settings_file", "/full/path/to/your/drupal/sites/default/settings.php"
+        // Or other args like --db-host, --db-port
       ],
-      "env": {},
+      "env": {
+        // Example: Set the settings file via environment variable
+        // "MCP_DRUPAL_SETTINGS_FILE": "/full/path/to/your/drupal/sites/default/settings.php"
+      },
       "enabled": true
     }
   }
 }
 ```
 
-**Key considerations for client-managed servers:**
-*   **Absolute Paths:** The `command` path and the `--settings_file` path in `args` should be absolute paths to ensure the client can find them regardless of its own working directory.
-*   **`run_server.sh`:** Our `run_server.sh` is designed to handle argument parsing, making it suitable for this configuration.
-*   **Environment Variables (`env`):** Our current Drupal server script doesn't require specific environment variables for configuration (it takes `settings_file` via `args`). If it did, you would set them in the `env` block.
-*   **Port Handling:** When a client launches the server, port negotiation might be handled automatically by the MCP client and server SDKs, or the server might need to output the port it has bound to so the client can connect.
+**Key considerations for client-managed servers (stdio):**
+*   **Absolute Paths:** The `command` path to Python/script and the `--settings_file` path in `args` (if used) should ideally be absolute paths to ensure the client can find them.
+*   **Environment Variables (`env`):** You can pass necessary configurations like `MCP_DRUPAL_SETTINGS_FILE` via the `env` block in the client's server configuration. This is often cleaner than long `args` lists.
+*   **No Host/Port:** The client does not need to specify host/port for the MCP server itself, as communication is over stdio.
 
-**2. Connecting to an Independently Running Server (Alternative):**
+**Connecting to an Independently Running HTTP Server (Less Common for Desktop Clients):**
 
-This approach is suitable if you prefer to start the `mcp_drupal_server.py` (or `run_server.sh`) manually and leave it running as a separate process, for example, on a remote machine or as a shared service. The client then connects to the server's specified URL.
+While the server is now primarily `stdio`-based, if you were to modify `mcp_drupal_server.py` to support HTTP again (e.g., by re-adding host/port arguments and `run_streamable_http_async`), you could connect to it as a networked service. This is generally not the standard method for local desktop clients which prefer managing the process via `stdio`.
 
-*   **Find the MCP Server Configuration Area:** In your client application, look for a settings or connections section related to Model Context Protocol, Tools, or External Data Sources.
-*   **Add a New MCP Server:** There should be an option to add or register a new MCP server.
-*   **Provide Server Details:** You will typically need to provide the server URL (e.g., `http://127.0.0.1:6789` if running locally with default port).
-
-*Example Client Configuration (e.g., in a `mcpServers.json` or similar client-side file for an independently running server):*
-```json
-[
-  {
-    "name": "My Drupal DB Server (Remote/Independent)",
-    "url": "http://127.0.0.1:6789", // Adjust if server is remote or uses a different port
-    "description": "Provides access to a Drupal database via MCP (server runs independently).",
-    "tools": ["drupal_database_query"], // Or the client might auto-discover tools
-    "enabled": true
-  }
-  // ... other server definitions ...
-]
-```
-**Note:** The exact fields and structure can vary. The `url` must match your running server's address.
-
-For specific instructions on how to configure either method, always refer to the documentation of your particular MCP client application.
+For specific instructions on how to configure client-managed servers, always refer to the documentation of your particular MCP client application.
 
 ## MCP Tool: `drupal_database_query`
 

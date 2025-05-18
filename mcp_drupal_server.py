@@ -1,18 +1,18 @@
 import argparse
 import logging
 import asyncio
-from typing import Optional, List, Dict, Any
+import json
+import os
+import re
+import subprocess
+import sys
+import inspect
+from typing import Optional, List, Dict, Any, Tuple, Sequence, Callable, Coroutine
 
-from mcp.server import ModelContextServer, Tool, tool
-from mcp.server_types import (    
-    ToolCallContext,
-    ToolCallRequest,
-    ToolCallResponse,
-    ToolCallResponsePayload,
-    ToolCallResponseContent,
-    ToolSchema, 
-    ToolParameterSchema
-)
+from mcp.server import FastMCP
+from mcp.server.fastmcp import Context
+from mcp.types import Tool as MCPToolType, CallToolRequest, CallToolResult, TextContent, EmbeddedResource, ImageContent
+from mcp.server.fastmcp.tools.base import Tool as HandlerTool
 
 from drupal_settings_parser import parse_settings_php
 from db_manager import DBManager
@@ -22,13 +22,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("mcp_drupal_server")
 
 # Global variable to hold the DBManager instance
-# This is not ideal for larger applications but suitable for this focused server.
-# In a more complex scenario, consider dependency injection or context management.
 db_manager_instance: Optional[DBManager] = None
 
-class DrupalBaseTool(Tool):
-    def __init__(self, name: str, description: str, parameters: List[ToolParameterSchema], db_manager: DBManager):
-        super().__init__(name=name, description=description, parameters=parameters)
+# Global variable for the FastMCP server instance, for mcp dev compatibility
+# Initialize FastMCP at the global scope
+server: FastMCP = FastMCP(name="MCP Drupal Database Server")
+
+class DrupalBaseTool(MCPToolType):
+    def __init__(self, name: str, description: str, input_schema: Dict[str, Any], db_manager: DBManager):
+        super().__init__(name=name, description=description, inputSchema=input_schema)
         self.db_manager = db_manager
 
     async def handle_db_call(self, db_operation, *args, **kwargs):
@@ -52,174 +54,255 @@ class DrupalBaseTool(Tool):
             logger.error(f"Unexpected error during tool call '{self.name}': {e}", exc_info=True)
             return None, f"An unexpected server error occurred: {e}"
 
-    async def create_response(self, request_id: str, result: Any, error_message: Optional[str]) -> ToolCallResponse:
+    async def create_response(self, result: Any, error_message: Optional[str]) -> CallToolResult:
         if error_message:
-            logger.warning(f"Tool call '{self.name}' failed for request {request_id}: {error_message}")
-            return ToolCallResponse(
-                id=request_id,
-                tool_name=self.name,
-                payload=ToolCallResponsePayload(error=error_message)
+            # Log with self.name if available, or a generic message if not (e.g. during db_manager init issues handled by this)
+            log_name = self.name if hasattr(self, 'name') else 'UnknownTool'
+            logger.warning(f"Tool call '{log_name}' failed: {error_message}")
+            return CallToolResult(
+                content=[TextContent(type="text", text=error_message)], 
+                isError=True
             )
         else:
-            logger.info(f"Tool call '{self.name}' successful for request {request_id}. Result: {str(result)[:200]}...")
-            return ToolCallResponse(
-                id=request_id,
-                tool_name=self.name,
-                payload=ToolCallResponsePayload(
-                    content=[ToolCallResponseContent(json=result)] # Return structured JSON
+            log_name = self.name if hasattr(self, 'name') else 'UnknownTool'
+            logger.info(f"Tool call '{log_name}' successful. Result: {str(result)[:200]}...")
+            try:
+                result_str = json.dumps(result)
+            except TypeError as e:
+                logger.error(f"Failed to serialize result to JSON for tool '{log_name}': {e}")
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"Server error: Failed to serialize result: {e}")],
+                    isError=True
                 )
+            return CallToolResult(
+                content=[TextContent(type="text", text=result_str)],
+                isError=False
             )
+
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        raise NotImplementedError("Tool subclasses must implement __call__")
 
 class DrupalListContentTypesTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_list_content_types",
             description="Lists all available Drupal content types (node types).",
-            parameters=[],
+            input_schema={"type": "object", "properties": {}},
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        logger.info(f"Executing tool: {self.name}")
-        result, error = await self.handle_db_call(self.db_manager.list_content_types)
-        return await self.create_response(request.id, result, error)
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        logger.info(f"Executing tool: {self.name} with arguments: {arguments}")
+        db_result, db_error = await self.handle_db_call(self.db_manager.list_content_types)
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
 
 class DrupalGetNodeByIdTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_get_node_by_id",
             description="Fetches detailed information for a specific Drupal node by its ID.",
-            parameters=[
-                ToolParameterSchema(name="nid", description="The Node ID (nid).", type="integer", required=True)
-            ],
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "nid": {
+                        "type": "integer",
+                        "description": "The Node ID (nid)."
+                    }
+                },
+                "required": ["nid"]
+            },
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        nid = request.parameters.get('nid')
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        nid = arguments.get('nid')
         logger.info(f"Executing tool: {self.name} with nid: {nid}")
         if not isinstance(nid, int):
-            return await self.create_response(request.id, None, "Invalid Node ID: nid must be an integer.")
-        result, error = await self.handle_db_call(self.db_manager.get_node_by_id, nid)
-        return await self.create_response(request.id, result, error)
+            # Use create_response to format an error CallToolResult, then raise from its content
+            call_tool_result = await self.create_response(None, "Invalid Node ID: nid must be an integer.")
+            raise Exception(call_tool_result.content[0].text) 
+
+        db_result, db_error = await self.handle_db_call(self.db_manager.get_node_by_id, nid)
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
 
 class DrupalListVocabulariesTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_list_vocabularies",
             description="Lists all taxonomy vocabularies in Drupal.",
-            parameters=[],
+            input_schema={"type": "object", "properties": {}},
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        logger.info(f"Executing tool: {self.name}")
-        result, error = await self.handle_db_call(self.db_manager.list_vocabularies)
-        return await self.create_response(request.id, result, error)
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        logger.info(f"Executing tool: {self.name} with arguments: {arguments}")
+        db_result, db_error = await self.handle_db_call(self.db_manager.list_vocabularies)
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
 
 class DrupalGetTaxonomyTermByIdTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_get_taxonomy_term_by_id",
             description="Fetches detailed information for a specific taxonomy term by its ID.",
-            parameters=[
-                ToolParameterSchema(name="tid", description="The Taxonomy Term ID (tid).", type="integer", required=True)
-            ],
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tid": {
+                        "type": "integer",
+                        "description": "The Taxonomy Term ID (tid)."
+                    }
+                },
+                "required": ["tid"]
+            },
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        tid = request.parameters.get('tid')
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        tid = arguments.get('tid')
         logger.info(f"Executing tool: {self.name} with tid: {tid}")
         if not isinstance(tid, int):
-            return await self.create_response(request.id, None, "Invalid Term ID: tid must be an integer.")
-        result, error = await self.handle_db_call(self.db_manager.get_taxonomy_term_by_id, tid)
-        return await self.create_response(request.id, result, error)
+            # Use create_response to format an error CallToolResult, then raise from its content
+            call_tool_result = await self.create_response(None, "Invalid Term ID: tid must be an integer.")
+            raise Exception(call_tool_result.content[0].text)
+
+        db_result, db_error = await self.handle_db_call(self.db_manager.get_taxonomy_term_by_id, tid)
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
 
 class DrupalGetUserByIdTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_get_user_by_id",
             description="Fetches detailed information for a specific Drupal user by their ID.",
-            parameters=[
-                ToolParameterSchema(name="uid", description="The User ID (uid).", type="integer", required=True)
-            ],
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "integer",
+                        "description": "The User ID (uid)."
+                    }
+                },
+                "required": ["uid"]
+            },
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        uid = request.parameters.get('uid')
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        uid = arguments.get('uid')
         logger.info(f"Executing tool: {self.name} with uid: {uid}")
         if not isinstance(uid, int):
-            return await self.create_response(request.id, None, "Invalid User ID: uid must be an integer.")
-        result, error = await self.handle_db_call(self.db_manager.get_user_by_id, uid)
-        return await self.create_response(request.id, result, error)
+            # Use create_response to format an error CallToolResult, then raise from its content
+            call_tool_result = await self.create_response(None, "Invalid User ID: uid must be an integer.")
+            raise Exception(call_tool_result.content[0].text)
+
+        db_result, db_error = await self.handle_db_call(self.db_manager.get_user_by_id, uid)
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
 
 class DrupalListParagraphsByNodeIdTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_list_paragraphs_by_node_id",
             description="Lists paragraph items referenced by a specific node through a given paragraph field. Note: Paragraph structure can be complex; this tool uses common conventions.",
-            parameters=[
-                ToolParameterSchema(name="nid", description="The Node ID (nid) that contains the paragraphs.", type="integer", required=True),
-                ToolParameterSchema(name="paragraph_field_name", description="The machine name of the paragraph reference field on the node (e.g., 'field_content_paragraphs').", type="string", required=True)
-            ],
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "nid": {
+                        "type": "integer",
+                        "description": "The Node ID (nid) that contains the paragraphs."
+                    },
+                    "paragraph_field_name": {
+                        "type": "string",
+                        "description": "The machine name of the paragraph reference field on the node (e.g., 'field_content_paragraphs')."
+                    }
+                },
+                "required": ["nid", "paragraph_field_name"]
+            },
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        nid = request.parameters.get('nid')
-        paragraph_field_name = request.parameters.get('paragraph_field_name')
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        nid = arguments.get('nid')
+        paragraph_field_name = arguments.get('paragraph_field_name')
         logger.info(f"Executing tool: {self.name} with nid: {nid}, paragraph_field_name: {paragraph_field_name}")
 
         if not isinstance(nid, int):
-            return await self.create_response(request.id, None, "Invalid Node ID: nid must be an integer.")
+            # Use create_response to format an error CallToolResult, then raise from its content
+            call_tool_result = await self.create_response(None, "Invalid Node ID: nid must be an integer.")
+            raise Exception(call_tool_result.content[0].text)
         if not isinstance(paragraph_field_name, str) or not paragraph_field_name.strip():
-            return await self.create_response(request.id, None, "Invalid paragraph field name: Must be a non-empty string.")
+            # Use create_response to format an error CallToolResult, then raise from its content
+            call_tool_result = await self.create_response(None, "Invalid paragraph field name: Must be a non-empty string.")
+            raise Exception(call_tool_result.content[0].text)
         
-        result, error = await self.handle_db_call(self.db_manager.list_paragraphs_by_node_id, nid, paragraph_field_name)
-        return await self.create_response(request.id, result, error)
+        db_result, db_error = await self.handle_db_call(self.db_manager.list_paragraphs_by_node_id, nid, paragraph_field_name)
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
 
 class DrupalDatabaseQueryTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
             name="drupal_database_query",
             description="General purpose tool to interact with a Drupal database. Can list tables, get table schema, and execute read-only SQL queries.",
-            parameters=[
-                ToolParameterSchema(
-                    name="action",
-                    description="The action to perform: 'list_tables', 'get_table_schema', or 'execute_sql'.",
-                    type="string",
-                    required=True,
-                    enum=['list_tables', 'get_table_schema', 'execute_sql']
-                ),
-                ToolParameterSchema(
-                    name="table_name",
-                    description="The name of the table (without prefix) for 'get_table_schema'.",
-                    type="string",
-                    required=False
-                ),
-                ToolParameterSchema(
-                    name="sql_query",
-                    description="The read-only SQL query to execute for 'execute_sql'. Use Drupal table prefixes if necessary (e.g., {node_field_data}).",
-                    type="string",
-                    required=False
-                ),
-                ToolParameterSchema(
-                    name="query_params",
-                    description="A list of parameters for the SQL query (for 'execute_sql', used in placeholders like %s).",
-                    type="array", 
-                    required=False
-                )
-            ],
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "The action to perform: 'list_tables', 'get_table_schema', or 'execute_sql'.",
+                        "enum": ["list_tables", "get_table_schema", "execute_sql"]
+                    },
+                    "table_name": {
+                        "type": "string",
+                        "description": "The name of the table (without prefix) for 'get_table_schema'."
+                    },
+                    "sql_query": {
+                        "type": "string",
+                        "description": "The read-only SQL query to execute for 'execute_sql'. Use Drupal table prefixes if necessary (e.g., {node_field_data})."
+                    },
+                    "query_params": {
+                        "type": "array",
+                        "description": "A list of parameters for the SQL query (for 'execute_sql', used in placeholders like %s).",
+                        "items": {"type": "string"} # Assuming params are strings, can be more generic if needed
+                    }
+                },
+                "required": ["action"]
+            },
             db_manager=db_manager
         )
 
-    async def __call__(self, context: ToolCallContext, request: ToolCallRequest) -> ToolCallResponse:
-        action = request.parameters.get('action')
-        table_name = request.parameters.get('table_name')
-        sql_query = request.parameters.get('sql_query')
-        query_params = request.parameters.get('query_params')
+    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        action = arguments.get('action')
+        table_name = arguments.get('table_name')
+        sql_query = arguments.get('sql_query')
+        query_params = arguments.get('query_params')
 
         logger.info(f"Executing tool: {self.name} with action: {action}, table_name: {table_name}, sql_query: {sql_query is not None}, query_params: {query_params is not None}")
 
@@ -262,25 +345,177 @@ class DrupalDatabaseQueryTool(DrupalBaseTool):
         # Use the base class create_response method for consistent response formatting
         # If result is already a string message (like "No data found..."), it will be wrapped in JSON by create_response.
         # If error_message is set, result will be ignored by create_response.
-        return await self.create_response(request.id, result, error_message)
+        call_tool_result = await self.create_response(result, error_message)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
+
+def find_project_root(settings_file_path: str) -> Optional[str]:
+    """Tries to find a project root by looking for a .ddev directory or common markers."""
+    current_path = os.path.dirname(os.path.abspath(settings_file_path))
+    # Common Drupal structures: sites/default/settings.php or web/sites/default/settings.php
+    # Look up a few levels for .ddev or composer.json
+    for _ in range(5): # Check up to 5 levels
+        if os.path.isdir(os.path.join(current_path, ".ddev")):
+            return current_path
+        if os.path.isfile(os.path.join(current_path, "composer.json")) and os.path.isdir(os.path.join(current_path, "web")):
+             # A common pattern for composer-based Drupal projects, .ddev might be here
+            if os.path.isdir(os.path.join(current_path, ".ddev")):
+                return current_path
+        parent_path = os.path.dirname(current_path)
+        if parent_path == current_path: # Reached filesystem root
+            break
+        current_path = parent_path
+    return None
+
+def detect_and_get_ddev_db_info(project_root: str) -> Optional[Tuple[str, int]]:
+    """Checks for a DDEV project and runs 'ddev describe' to get DB host and port."""
+    if not project_root or not os.path.isdir(os.path.join(project_root, ".ddev")):
+        logger.info("Not a DDEV project or .ddev directory not found at presumed root.")
+        return None
+
+    try:
+        logger.info(f"DDEV project detected at {project_root}. Running 'ddev describe'...")
+        original_cwd = os.getcwd()
+        os.chdir(project_root) # Change to project root
+
+        result = subprocess.run(
+            ["ddev", "describe"], # Removed --project-root
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15
+        )
+        output = result.stdout
+        logger.debug(f"'ddev describe' output:\n{output}")
+
+        # Regex to find the MySQL/MariaDB host and port exposed to the host machine
+        # Example line: │  - db:3306 -> 127.0.0.1:32801                      │ User/Pass: 'db/db' │
+        match = re.search(r"[a-zA-Z0-9_-]+:3306\s*->\s*(127\.0\.0\.1):(\d+)", output, re.IGNORECASE)
+        if match:
+            host = match.group(1)
+            port = int(match.group(2))
+            logger.info(f"DDEV discovered database at {host}:{port}")
+            return host, port
+        else:
+            logger.warning("Could not parse DDEV host/port from 'ddev describe' output.")
+            return None
+    except FileNotFoundError:
+        logger.warning("'ddev' command not found. Is DDEV installed and in PATH?")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"'ddev describe' failed: {e}\nStderr: {e.stderr}")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("'ddev describe' timed out.")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while running/parsing 'ddev describe': {e}")
+        return None
+    finally:
+        if 'original_cwd' in locals(): # Ensure original_cwd was set
+            os.chdir(original_cwd) # Change back to original cwd
 
 async def main():
     global db_manager_instance
+    global server # Declare that we are using the global server variable
 
     parser = argparse.ArgumentParser(description="MCP Server for Drupal Database Interaction.")
-    parser.add_argument("--settings_file", type=str, required=True, help="Path to the Drupal settings.php file.")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host for the MCP server.")
-    parser.add_argument("--port", type=int, default=6789, help="Port for the MCP server.")
+    # Make settings_file not strictly required at argparse level
+    parser.add_argument("--settings_file", type=str, help="Path to the Drupal settings.php file. Can also be set via MCP_DRUPAL_SETTINGS_FILE env var.")
+    # Removed host and port arguments
+    parser.add_argument("--db-host", type=str, help="Override database host (e.g., for DDEV).")
+    parser.add_argument("--db-port", type=int, help="Override database port (e.g., for DDEV).")
     args = parser.parse_args()
 
-    logger.info(f"Attempting to parse settings file: {args.settings_file}")
-    db_config = parse_settings_php(args.settings_file)
+    # Determine settings_file_to_parse
+    settings_file_to_parse = args.settings_file
+    if not settings_file_to_parse:
+        settings_file_to_parse = os.environ.get("MCP_DRUPAL_SETTINGS_FILE")
+        if settings_file_to_parse:
+            logger.info("Using settings_file path from MCP_DRUPAL_SETTINGS_FILE environment variable.")
+        else:
+            logger.error("Error: --settings_file argument is required, or MCP_DRUPAL_SETTINGS_FILE environment variable must be set.")
+            parser.print_help()
+            return # Exit if no settings file path is available
 
-    if not db_config:
-        logger.error("Failed to parse database configuration. Exiting.")
-        return
+    db_config_source_description = f"initial settings file: {settings_file_to_parse}"
 
-    logger.info(f"Database configuration parsed successfully: {db_config.get('driver')} on {db_config.get('host')}")
+    # DDEV detection and db_config override logic
+    if args.db_host and args.db_port:
+        logger.info(f"Using manually specified DB host: {args.db_host} and port: {args.db_port}")
+        # Parse the original settings file first to get other DB details like user, pass, dbname
+        db_config = parse_settings_php(settings_file_to_parse)
+        if not db_config:
+            logger.error(f"Failed to parse base database configuration from {settings_file_to_parse} when manual overrides were given. Exiting.")
+            return
+        db_config['host'] = args.db_host
+        db_config['port'] = str(args.db_port) 
+        db_config_source_description = "manual DB host/port override"
+    else:
+        drupal_project_root = find_project_root(settings_file_to_parse)
+        if drupal_project_root and os.path.isdir(os.path.join(drupal_project_root, ".ddev")):
+            logger.info(f"DDEV project detected at {drupal_project_root}.")
+            
+            settings_dir = os.path.dirname(os.path.abspath(settings_file_to_parse))
+            potential_ddev_files_to_try = [
+                os.path.join(settings_dir, 'settings.local.php'),
+                os.path.join(settings_dir, 'settings.ddev.php')
+            ]
+            
+            db_config = None
+            parsed_ddev_specific_file = False
+            for candidate_path in potential_ddev_files_to_try:
+                if os.path.isfile(candidate_path):
+                    logger.info(f"Attempting to parse DDEV-related settings from: {candidate_path}")
+                    temp_config = parse_settings_php(candidate_path)
+                    if temp_config and 'username' in temp_config: # Check if parsing was successful and got key fields
+                        db_config = temp_config
+                        settings_file_to_parse = candidate_path # Update for logging and consistency
+                        db_config_source_description = f"DDEV-related settings: {candidate_path}"
+                        parsed_ddev_specific_file = True
+                        logger.info(f"Successfully parsed DB credentials from {candidate_path}")
+                        break # Found a good DDEV settings file
+                    else:
+                        logger.info(f"Could not extract complete DB credentials from {candidate_path}. Will try next candidate or fall back.")
+                else:
+                    logger.info(f"DDEV-related candidate file not found: {candidate_path}")
+            
+            if not parsed_ddev_specific_file:
+                logger.info(f"No suitable DDEV-specific settings file yielded credentials. Parsing main settings file: {settings_file_to_parse}")
+                settings_file_to_parse = settings_file_to_parse # Ensure this is the actual file being parsed now
+                db_config = parse_settings_php(settings_file_to_parse)
+                db_config_source_description = f"main settings file: {settings_file_to_parse}" # Corrected source description
+
+            if not db_config: # If, after all attempts, db_config is still None
+                logger.error(f"Failed to parse database configuration from all attempted sources (last tried: {settings_file_to_parse}). Exiting.")
+                return
+
+            # Get DDEV host/port from 'ddev describe' and override if found
+            ddev_db_info = detect_and_get_ddev_db_info(drupal_project_root)
+            if ddev_db_info:
+                ddev_host, ddev_port = ddev_db_info
+                logger.info(f"Overriding DB host/port with DDEV discovered: {ddev_host}:{ddev_port}")
+                db_config['host'] = ddev_host
+                db_config['port'] = str(ddev_port)
+                db_config_source_description += " (with DDEV host/port override)"
+            else:
+                logger.info("DDEV host/port discovery failed or not applicable. Using host/port from settings file.")
+        else:
+            logger.info("Not a DDEV project or root not found. Using settings from the provided file path.")
+            db_config = parse_settings_php(settings_file_to_parse)
+            if not db_config:
+                logger.error(f"Failed to parse database configuration from {settings_file_to_parse}. Exiting.")
+                return
+
+    # Prepare values for logging to avoid complex f-string nesting issues
+    log_db_driver = db_config.get('driver')
+    log_db_host = db_config.get('host')
+    log_db_port = db_config.get('port')
+    log_db_user = db_config.get('username')
+    logger.info(f"Effective database configuration (from {db_config_source_description}): driver '{log_db_driver}', host '{log_db_host}', port '{log_db_port}', user '{log_db_user}'")
 
     try:
         db_manager_instance = DBManager(db_config)
@@ -292,6 +527,10 @@ async def main():
         return
 
     # Instantiate all tools
+    if not db_manager_instance:
+        logger.error("DBManager not initialized before tool creation. Exiting.")
+        return
+
     drupal_query_tool = DrupalDatabaseQueryTool(db_manager=db_manager_instance)
     list_content_types_tool = DrupalListContentTypesTool(db_manager=db_manager_instance)
     get_node_by_id_tool = DrupalGetNodeByIdTool(db_manager=db_manager_instance)
@@ -300,7 +539,7 @@ async def main():
     get_user_by_id_tool = DrupalGetUserByIdTool(db_manager=db_manager_instance)
     list_paragraphs_tool = DrupalListParagraphsByNodeIdTool(db_manager=db_manager_instance)
 
-    all_tools = [
+    all_tools_objects = [
         drupal_query_tool,
         list_content_types_tool,
         get_node_by_id_tool,
@@ -310,20 +549,57 @@ async def main():
         list_paragraphs_tool
     ]
     
-    server = ModelContextServer(
-        tools=all_tools,
-        host=args.host,
-        port=args.port,
-    )
+    # Register tools using the server's add_tool method and then try to override schema
+    for tool_obj in all_tools_objects:
+        if not hasattr(server, 'add_tool') or not hasattr(server, '_tool_manager') or not hasattr(server._tool_manager, '_tools'):
+            logger.error("Server object or its ToolManager is not configured as expected. Cannot register tools.")
+            return
+        
+        try:
+            # Register the tool using server.add_tool.
+            # This will infer a basic schema from tool_obj.__call__(self, arguments: dict).
+            server.add_tool(
+                fn=tool_obj.__call__, 
+                name=tool_obj.name,
+                description=tool_obj.description
+            )
+            logger.info(f"Registered tool via server.add_tool: {tool_obj.name}")
 
-    logger.info(f"Starting MCP Drupal Database Server on {args.host}:{args.port}")
-    for t in all_tools:
-        logger.info(f"Registered tool: {t.name}")
-    logger.info("Server is ready to accept connections from MCP clients.")
-    logger.info("Press Ctrl+C to stop the server.")
+            # Attempt to override the inferred schema with our predefined inputSchema.
+            registered_tool_handler = server._tool_manager._tools.get(tool_obj.name)
+            if registered_tool_handler:
+                if hasattr(registered_tool_handler, 'parameters'):
+                    logger.info(f"Overriding schema for tool: {tool_obj.name}")
+                    registered_tool_handler.parameters = tool_obj.inputSchema
+                else:
+                    logger.warning(f"Registered tool {tool_obj.name} does not have 'parameters' attribute to override schema.")
+            else:
+                logger.warning(f"Could not find registered tool {tool_obj.name} in ToolManager to override schema.")
+
+        except Exception as e:
+            logger.error(f"Failed to register or modify tool {tool_obj.name}: {e}", exc_info=True)
+
+    logger.info(f"Starting MCP Drupal Database Server with stdio transport.")
+    logger.info("Server is ready to accept connections from MCP clients via stdio.")
+    logger.info("Press Ctrl+C to stop the server (if run interactively).")
 
     try:
-        await server.serve()
+        # server.run is synchronous, ensure it's called correctly in an async context
+        # For stdio, typically server.run(transport='stdio') is synchronous.
+        # If FastMCP's run can be awaited or needs special handling for asyncio, adjust accordingly.
+        # Assuming server.run(transport='stdio') is the correct synchronous call:
+        # To run a sync function in async, you might need asyncio.to_thread or similar
+        # However, for a top-level script, directly calling server.run might be intended.
+        # Let's assume FastMCP handles the asyncio loop if run is called from within one.
+        # The MCP examples for Python often show mcp.run(transport='stdio') in the `if __name__ == "__main__":` block directly.
+        # If main() must be async, and server.run is sync, it needs careful handling.
+        # For now, let's try the direct call as per typical MCP examples.
+        # If this causes issues, we may need to wrap it or restructure.
+        
+        # The standard way to run with stdio:
+        # server.run(transport='stdio') # This was causing the nested asyncio loop error
+        await server.run_stdio_async() # Use the async version for stdio
+
     except KeyboardInterrupt:
         logger.info("Server shutting down...")
     finally:
@@ -333,6 +609,31 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        # If main is now less async-focused due to server.run(transport='stdio') being sync,
+        # we might not need asyncio.run(main()) if main() itself becomes synchronous.
+        # However, other parts of main (like tool calls if they were awaited directly in main)
+        # might still require an async context.
+        # Given `await server.run_streamable_http_async()` was used, `main` is async.
+        # `server.run(transport='stdio')` is typically blocking and synchronous.
+        # To call a blocking sync function from an async function, use asyncio.to_thread.
+        
+        # Let's keep main() async for now and adapt the run call.
+        # If server.run(transport='stdio') is blocking, we should run it in a thread.
+        # Or, FastMCP might have an async version for stdio.
+        # The quickstart shows `mcp.run(transport='stdio')` directly in `if __name__ == "__main__"`.
+        # This implies it manages its own loop or is synchronous.
+        
+        # Re-evaluating: If main() contains `await` for other things (not shown in snippet but possible),
+        # it must remain async. If `server.run(transport='stdio')` is blocking, it will block the asyncio event loop.
+        # The example `if __name__ == "__main__": mcp.run(transport='stdio')`
+        # implies `mcp.run` takes over.
+
+        # Let's simplify `main` to be synchronous if its only async part was `server.run_streamable_http_async`.
+        # Then `asyncio.run(main())` would be `main()`.
+        # For now, I will assume FastMCP's `run(transport='stdio')` can be called from an async main
+        # and it will block appropriately or integrate with the existing loop.
+        # This is the most direct change from run_streamable_http_async().
+
         asyncio.run(main())
     except Exception as e:
         logger.error(f"Critical error during server startup or runtime: {e}", exc_info=True) 

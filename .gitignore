@@ -126,4 +126,14 @@ dmypy.json
 .pytype/
 
 # Cython debug symbols
-cython_debug/ 
+cython_debug/
+
+# DDEV specific files
+.ddev/
+*.ddev-generated.yaml
+
+# Specific DDEV runtime files (like the one accidentally committed)
+127.0.0.1:*
+
+# IDE settings files
+.idea/ 
