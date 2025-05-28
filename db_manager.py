@@ -4,6 +4,7 @@ import pyodbc  # Added for SQL Server
 import cx_Oracle # Added for Oracle
 import logging
 from typing import List, Dict, Any, Optional
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -167,30 +168,57 @@ class DBManager:
                     row = self.cursor.fetchone()
                     if row:
                         driver = self.db_config.get('driver')
+                        result_dict = None
                         # For psycopg2, cursor.fetchone() returns a tuple. Convert to dict.
                         if driver == 'pgsql' and isinstance(row, tuple):
-                            return {desc[0]: value for desc, value in zip(self.cursor.description, row)}
+                            result_dict = {desc[0]: value for desc, value in zip(self.cursor.description, row)}
                         # For pyodbc (mssql), rows are pyodbc.Row objects or tuples, convert to dict
                         elif driver == 'mssql':
-                            return {col_name: getattr(row, col_name) for col_name in column_names}
+                            result_dict = {col_name: getattr(row, col_name) for col_name in column_names}
                         # For cx_Oracle, rows are tuples by default, convert to dict
                         elif driver == 'oracle' and isinstance(row, tuple):
-                             return {col_name: value for col_name, value in zip(column_names, row)}
-                        return row # MySQL dictionary cursor already returns dict
+                             result_dict = {col_name: value for col_name, value in zip(column_names, row)}
+                        elif driver == 'mysql': # MySQL dictionary cursor already returns dict
+                            result_dict = row 
+                        
+                        if result_dict is not None:
+                            return self._sanitize_dict_values_for_json(result_dict)
+                        # This fallback should ideally not be reached if all drivers are handled above
+                        # and result_dict is always populated when row is not None.
+                        # If row itself could be non-dict and non-tuple (e.g. primitive directly from a specific driver),
+                        # it might pass through here. However, current logic aims for dicts.
+                        return row 
                     return None
                 else:
                     rows = self.cursor.fetchall()
                     if rows:
                         driver = self.db_config.get('driver')
+                        processed_rows_list_of_dicts = []
                         if driver == 'pgsql' and rows and isinstance(rows[0], tuple):
-                            return [{desc[0]: value for desc, value in zip(self.cursor.description, row)} for row in rows]
+                            processed_rows_list_of_dicts = [{desc[0]: value for desc, value in zip(self.cursor.description, r)} for r in rows]
                         # For pyodbc (mssql), convert list of pyodbc.Row or tuples to list of dicts
-                        elif driver == 'mssql':
-                            return [{col_name: getattr(row_obj, col_name) for col_name in column_names} for row_obj in rows]
+                        elif driver == 'mssql' and rows: # Assuming rows is a list of pyodbc.Row objects
+                            processed_rows_list_of_dicts = [{col_name: getattr(row_obj, col_name) for col_name in column_names} for row_obj in rows]
                         # For cx_Oracle, convert list of tuples to list of dicts
                         elif driver == 'oracle' and rows and isinstance(rows[0], tuple):
-                            return [{col_name: value for col_name, value in zip(column_names, row_tuple)} for row_tuple in rows]
-                        return rows # MySQL dictionary cursor already returns list of dicts
+                            processed_rows_list_of_dicts = [{col_name: value for col_name, value in zip(column_names, row_tuple)} for row_tuple in rows]
+                        elif driver == 'mysql': # MySQL dictionary cursor already returns list of dicts
+                            processed_rows_list_of_dicts = rows
+                        else: # Fallback if rows is not empty but not handled above (e.g. unknown driver with unexpected row format)
+                            # This path implies 'rows' might not be a list of dicts.
+                            # If it's a list of non-dicts, _sanitize_dict_values_for_json would fail.
+                            # For safety, only process if it's confirmed list of dicts (as per MySQL path)
+                            # Other paths ensure conversion to list of dicts first.
+                            # If code reaches here for an unhandled driver, best to return as is or log.
+                            # Given current logic, this 'else' for processed_rows_list_of_dicts should ideally not be hit if rows were fetched.
+                            logger.warning(f"Fetched rows for driver {driver} but format not explicitly handled for sanitization; returning as is if not list of dicts.")
+                            if all(isinstance(r, dict) for r in rows):
+                                processed_rows_list_of_dicts = rows
+                            else: # Cannot sanitize if not list of dicts
+                                return rows 
+
+
+                        return [self._sanitize_dict_values_for_json(r) for r in processed_rows_list_of_dicts]
                     return [] # Return empty list if no rows found
             else: # For queries that don't return rows (INSERT, UPDATE, DELETE)
                 self.connection.commit() # Ensure changes are committed
@@ -261,16 +289,18 @@ class DBManager:
         schema = {}
 
         if driver == 'mysql':
-            query = f"DESCRIBE {mysql.connector.utils.escape_table_name(full_table_name)}" 
-            # Note: escape_table_name is a conceptual placeholder; actual escaping needs to be handled carefully if using mysql.connector.
-            # For DESCRIBE, the table name typically doesn't need complex escaping unless it has very unusual characters.
-            # A safer direct approach without a specific escape function from the library for this command:
             # Ensure full_table_name is alphanumeric with underscores to prevent injection before direct insertion.
             if not re.match(r'^[a-zA-Z0-9_]+$', full_table_name):
                 logger.error(f"Invalid table name for schema retrieval: {full_table_name}")
                 return None
             query = f"DESCRIBE `{full_table_name}`" # Use backticks for MySQL
-
+            results = self.execute_query(query)
+            if results:
+                for row in results: # row is a dict from dictionary cursor
+                    # Example MySQL row: {'Field': 'nid', 'Type': 'int(10) unsigned', 'Null': 'NO', 'Key': 'PRI', 'Default': None, 'Extra': ''}
+                    schema[row['Field']] = row['Type']
+                return schema
+            return None # If query fails or no results for DESCRIBE
         elif driver == 'pgsql':
             query = """
                 SELECT column_name, data_type 
@@ -324,6 +354,29 @@ class DBManager:
             logger.error(f"Unsupported driver for get_table_schema: {driver}")
             return None
 
+    def _get_text_like_column_types(self, driver: str) -> List[str]:
+        """Returns a list of common text-like column type names (lowercase) for the given driver."""
+        if driver == 'mysql':
+            return ['varchar', 'text', 'char', 'longtext', 'mediumtext', 'tinytext', 'enum', 'set']
+        elif driver == 'pgsql':
+            return ['character varying', 'varchar', 'text', 'char', 'character', 'name']
+        elif driver == 'mssql':
+            return ['varchar', 'nvarchar', 'text', 'ntext', 'char', 'nchar']
+        elif driver == 'oracle':
+            return ['varchar2', 'nvarchar2', 'clob', 'nclob', 'char', 'nchar', 'long']
+        return []
+
+    def _quote_identifier(self, identifier: str) -> str:
+        """Quotes an SQL identifier based on the database driver."""
+        driver = self.db_config.get('driver')
+        if driver == 'mysql':
+            return f"`{identifier}`"
+        elif driver == 'pgsql' or driver == 'oracle': # Oracle also uses double quotes, but case sensitivity is a factor.
+            return f'"{identifier}"' # Standard SQL, PostgreSQL is case-sensitive with quotes. Oracle typically folds to uppercase if not quoted.
+        elif driver == 'mssql':
+            return f"[{identifier}]"
+        return identifier # Default to no quoting if driver unknown or doesn't need it for simple identifiers
+
     def prepare_query(self, query: str) -> str:
         """Replaces {{table_name}} with the prefixed table name."""
         prefix = self.db_config.get('prefix', '')
@@ -332,10 +385,105 @@ class DBManager:
 
     def _extract_table_names(self, query: str) -> List[str]:
         """Helper to extract unique table names from {{table_name}} placeholders in a query."""
-        import re
         # Matches {{table_name}} allowing for spaces around table_name
         matches = re.findall(r"{\{\s*([a-zA-Z0-9_]+)\s*\}}", query)
         return list(set(matches)) # Return unique table names
+
+    def search_string_in_all_tables(self, search_string: str, row_limit_per_column: int = 5) -> List[Dict[str, Any]]:
+        """
+        Searches for a string in all text-like columns of all tables.
+
+        Args:
+            search_string: The string to search for.
+            row_limit_per_column: Max number of rows to return per column match.
+
+        Returns:
+            A list of dictionaries, where each dictionary contains:
+            'table_name', 'column_name', and 'matching_rows' (list of dicts).
+        """
+        all_findings: List[Dict[str, Any]] = []
+        table_names = self.get_tables()
+        if not table_names:
+            logger.info("No tables found to search.")
+            return all_findings
+
+        driver = self.db_config.get('driver')
+        text_like_types = self._get_text_like_column_types(driver)
+        search_pattern = f"%{search_string}%"
+
+        for table_name in table_names:
+            # Skip system tables or tables with very unusual names for safety if needed,
+            # but get_tables() should provide application-level tables.
+            # The table_name from get_tables() is unprefixed.
+            prefixed_table_name = f"{self.db_config.get('prefix', '')}{table_name}"
+            
+            logger.info(f"Searching in table: {prefixed_table_name}")
+            schema = self.get_table_schema(table_name) # unprefixed name
+            if not schema:
+                logger.warning(f"Could not get schema for table: {table_name}. Skipping.")
+                continue
+
+            for column_name, column_type in schema.items():
+                # Normalize column_type (e.g., 'VARCHAR(255)' -> 'varchar')
+                normalized_column_type = column_type.split('(')[0].lower()
+                if normalized_column_type in text_like_types:
+                    logger.debug(f"Found text-like column: {column_name} ({column_type}) in table {table_name}")
+                    
+                    # Construct query. Table and column names from schema are considered "safe"
+                    # but quoting is good practice for robustness.
+                    quoted_table = self._quote_identifier(prefixed_table_name)
+                    quoted_column = self._quote_identifier(column_name)
+                    
+                    # LIMIT clause syntax varies.
+                    # MySQL, PostgreSQL: LIMIT N
+                    # SQL Server: TOP N (used in SELECT TOP N ... FROM)
+                    # Oracle: ROWNUM <= N (used in WHERE clause or subquery)
+                    query = ""
+                    params: Optional[tuple] = None
+                    current_search_pattern: str
+
+                    if driver in ['mysql', 'mssql', 'oracle']:
+                        current_search_pattern = f"%{search_string.lower()}%"
+                        where_clause = f"LOWER({quoted_column}) LIKE %s"
+                        if driver == 'mysql':
+                            query = f"SELECT * FROM {quoted_table} WHERE {where_clause} LIMIT %s"
+                            params = (current_search_pattern, row_limit_per_column)
+                        elif driver == 'mssql':
+                            # pyodbc uses ? for placeholders
+                            query = f"SELECT TOP ? * FROM {quoted_table} WHERE {where_clause}"
+                            params = (row_limit_per_column, current_search_pattern) # Order for TOP then LIKE
+                        elif driver == 'oracle':
+                            query = f"SELECT * FROM (SELECT * FROM {quoted_table} WHERE {where_clause} ORDER BY 1) WHERE ROWNUM <= %s"
+                            params = (current_search_pattern, row_limit_per_column)
+                    elif driver == 'pgsql':
+                        current_search_pattern = f"%{search_string}%" # ILIKE handles case itself
+                        query = f"SELECT * FROM {quoted_table} WHERE {quoted_column} ILIKE %s LIMIT %s"
+                        params = (current_search_pattern, row_limit_per_column)
+                    else:
+                        logger.warning(f"Case-insensitivity and LIMIT logic for driver {driver} not fully implemented in search_string_in_all_tables. Using basic LIKE. Skipping limit for {table_name}.{column_name}")
+                        current_search_pattern = f"%{search_string}%"
+                        query = f"SELECT * FROM {quoted_table} WHERE {quoted_column} LIKE %s"
+                        params = (current_search_pattern,)
+
+                    if not query:
+                        continue
+
+                    try:
+                        logger.debug(f"Executing search query on {table_name}.{column_name}: {query} with params {params}")
+                        matching_rows = self.execute_query(query, params)
+                        if matching_rows:
+                            logger.info(f"Found '{search_string}' in {table_name}.{column_name}. Rows: {len(matching_rows)}")
+                            all_findings.append({
+                                "table_name": table_name, # unprefixed
+                                "column_name": column_name,
+                                "matching_rows": matching_rows
+                            })
+                    except Exception as e:
+                        logger.error(f"Error searching in {table_name}.{column_name}: {e}. Query: {query}")
+                        # Continue to other columns/tables
+        
+        logger.info(f"Global search for '{search_string}' complete. Found {len(all_findings)} instances.")
+        return all_findings
 
     # New Drupal-specific methods for DBManager class:
     def get_node_by_id(self, nid: int) -> Optional[Dict[str, Any]]:
@@ -466,6 +614,164 @@ class DBManager:
             logger.error(f"Error in list_paragraphs_by_node_id for nid {nid}, field {paragraph_field_name}: {e}")
             logger.error(f"Problematic query was: {{query}}")
             return None
+
+    def _sanitize_dict_values_for_json(self, row_dict: Dict[str, Any]) -> Dict[str, Any]:
+        for key, value in row_dict.items():
+            if isinstance(value, bytes):
+                try:
+                    row_dict[key] = value.decode('utf-8')
+                except UnicodeDecodeError:
+                    row_dict[key] = "[binary data (not displayable)]"
+        return row_dict
+
+    def list_paragraph_types_with_fields(self) -> Optional[Dict[str, Any]]:
+        """
+        Lists all paragraph types and their defined fields.
+
+        Returns:
+            A dictionary where keys are paragraph type machine names, 
+            and values are lists of dictionaries, each representing a field 
+            (with keys like 'field_name', 'field_type', 'field_label', 'required', etc.).
+            Returns None on error.
+        """
+        paragraph_types_query = self.prepare_query("SELECT id, label FROM {paragraphs_type}")
+        logger.info(f"Executing query for paragraph types: {paragraph_types_query}")
+        paragraph_types_rows = self.execute_query(paragraph_types_query)
+        logger.info(f"Paragraph types query result: {paragraph_types_rows}")
+
+        if paragraph_types_rows is None: # Could be an error or no paragraph types
+            logger.info("Could not retrieve paragraph types or no paragraph types found (paragraph_types_rows is None).")
+            return {}
+        
+        if not paragraph_types_rows: # Check for empty list specifically
+            logger.info("No paragraph types found (paragraph_types_rows is an empty list).")
+            return {}
+
+        result = {}
+        for pt_row in paragraph_types_rows:
+            paragraph_type_id = pt_row['id']
+            paragraph_type_label = pt_row['label']
+            logger.info(f"Processing paragraph type: ID = {paragraph_type_id}, Label = {paragraph_type_label}")
+            
+            # In D8/9+, field config is stored in config system, but also reflected in DB tables
+            # like 'config' or specific entity field tables.
+            # For a more direct DB approach for fields:
+            # field_storage_config: general field properties (type)
+            # field_config: instance of field on an entity bundle (label, required, settings)
+            
+            # This query gets fields attached to a specific paragraph bundle
+            # bundle is the paragraph type's machine name (id)
+            fields_query_sql = self.prepare_query(f"""
+                SELECT 
+                    fc.field_name, 
+                    fsc.type AS field_type,
+                    fc.label AS field_label,  -- This might not be directly in field_config, often in config exports
+                                              -- We might need to parse serialized data or simplify
+                    fc.required,
+                    fc.settings AS field_settings, -- often serialized
+                    fc.default_value AS field_default_value -- often serialized
+                FROM 
+                    {{field_config}} fc
+                JOIN 
+                    {{field_storage_config}} fsc ON fc.field_name = fsc.field_name AND fc.entity_type = fsc.entity_type
+                WHERE 
+                    fc.entity_type = 'paragraph' AND fc.bundle = %s
+            """)
+            
+            # The label for a field instance (fc.label) might be complex if it's stored
+            # as a TranslatableMarkup object and serialized in the config system.
+            # The 'config' table has raw config data but parsing that is very complex.
+            # The fc.label in the database *should* be the plain label if available there from older versions or simple cases.
+            # We will attempt to retrieve fc.label. If it's not available or needs more complex parsing,
+            # we might get NULL or a serialized string.
+            # For simplicity, we're taking fc.label as is.
+
+            # fc.label often comes from the 'config' table's data column (serialized).
+            # A more robust way would be to use Drupal API if running within Drupal.
+            # Here, we rely on what's queryable directly.
+            # Let's assume for now `field_config` has a usable `label` column directly for this example.
+            # If `fc.label` doesn't exist or isn't what we need, we'd have to look at the serialized `data`
+            # attribute of `field_config` or the `config` table, which is much harder.
+            # Many Drupal database tools show `label` as part of `field_config` table structure.
+
+            # Let's re-evaluate the label source. Typically, `field_config` does NOT have a direct `label` column.
+            # The label is part of the serialized `data` in `field_config` or managed by the config system.
+            # The query below will be simplified and we'll note that 'field_label' might be the field_name if a true label isn't easily queryable.
+
+            # Corrected approach: Use field_name as a stand-in if true label is too hard to get.
+            # For field_type from field_storage_config.
+            # For required from field_config.
+            
+            # Field settings and default_value are often serialized strings.
+            # We will fetch them but won't attempt to deserialize them in this step for simplicity.
+
+            fields_for_bundle_sql = self.prepare_query(f"""
+                SELECT 
+                    fc.field_name,
+                    fsc.type AS field_type,
+                    fc.required,
+                    fsc.settings AS field_storage_settings, -- Serialized
+                    fc.settings AS field_instance_settings, -- Serialized
+                    fc.default_value_callback,
+                    fc.default_value -- Serialized
+                    -- fc.label IS NOT a standard column. Label is typically in serialized config.
+                    -- For simplicity, the UI displaying this might use field_name if label is complex.
+                FROM 
+                    {{field_config}} fc
+                INNER JOIN 
+                    {{field_storage_config}} fsc ON fc.field_name = fsc.field_name AND fc.entity_type = fsc.entity_type
+                WHERE 
+                    fc.entity_type = 'paragraph' AND fc.bundle = %s
+                ORDER BY fc.field_name;
+            """)
+
+            logger.info(f"Executing query for fields of paragraph type '{paragraph_type_id}': {fields_for_bundle_sql}")
+            field_details_rows = self.execute_query(fields_for_bundle_sql, params=(paragraph_type_id,))
+            logger.info(f"Field details query result for '{paragraph_type_id}': {field_details_rows}")
+            
+            current_fields = []
+            if field_details_rows:
+                for fd_row in field_details_rows:
+                    # Sanitize serialized fields before adding
+                    field_storage_settings_str = fd_row.get('field_storage_settings')
+                    if isinstance(field_storage_settings_str, bytes):
+                        try:
+                            field_storage_settings_str = field_storage_settings_str.decode('utf-8')
+                        except UnicodeDecodeError:
+                            field_storage_settings_str = "[binary data]"
+                    
+                    field_instance_settings_str = fd_row.get('field_instance_settings')
+                    if isinstance(field_instance_settings_str, bytes):
+                        try:
+                            field_instance_settings_str = field_instance_settings_str.decode('utf-8')
+                        except UnicodeDecodeError:
+                            field_instance_settings_str = "[binary data]"
+
+                    default_value_str = fd_row.get('default_value')
+                    if isinstance(default_value_str, bytes):
+                        try:
+                            default_value_str = default_value_str.decode('utf-8')
+                        except UnicodeDecodeError:
+                            default_value_str = "[binary data]"
+
+                    current_fields.append({
+                        "field_name": fd_row.get('field_name'),
+                        "field_type": fd_row.get('field_type'),
+                        "required": bool(fd_row.get('required')), # Ensure boolean
+                        # "field_label": fd_row.get('label', fd_row.get('field_name')), # Using field_name as fallback
+                        "field_storage_settings": field_storage_settings_str,
+                        "field_instance_settings": field_instance_settings_str,
+                        "default_value_callback": fd_row.get('default_value_callback'),
+                        "default_value": default_value_str,
+                    })
+            
+            result[paragraph_type_id] = {
+                "label": paragraph_type_label,
+                "machine_name": paragraph_type_id,
+                "fields": current_fields
+            }
+
+        return result
 
 # Example Usage (for testing purposes, typically this class would be used by the MCP server)
 if __name__ == '__main__':
