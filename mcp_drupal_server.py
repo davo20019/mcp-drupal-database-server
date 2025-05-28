@@ -87,12 +87,12 @@ class DrupalListContentTypesTool(DrupalBaseTool):
         super().__init__(
             name="drupal_list_content_types",
             description="Lists all available Drupal content types (node types).",
-            input_schema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {"random_string": {"type": "string", "description": "A dummy string argument required by the tool signature."}}, "required": ["random_string"]},
             db_manager=db_manager
         )
 
-    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-        logger.info(f"Executing tool: {self.name} with arguments: {arguments}")
+    async def __call__(self, random_string: str) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        logger.info(f"Executing tool: {self.name} with random_string: '{random_string}' (dummy argument)")
         db_result, db_error = await self.handle_db_call(self.db_manager.list_content_types)
         call_tool_result = await self.create_response(db_result, db_error)
         if call_tool_result.isError:
@@ -140,12 +140,12 @@ class DrupalListVocabulariesTool(DrupalBaseTool):
         super().__init__(
             name="drupal_list_vocabularies",
             description="Lists all taxonomy vocabularies in Drupal.",
-            input_schema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {"random_string": {"type": "string", "description": "A dummy string argument required by the tool signature."}}, "required": ["random_string"]},
             db_manager=db_manager
         )
 
-    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-        logger.info(f"Executing tool: {self.name} with arguments: {arguments}")
+    async def __call__(self, random_string: str) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        logger.info(f"Executing tool: {self.name} with random_string: '{random_string}' (dummy argument)")
         db_result, db_error = await self.handle_db_call(self.db_manager.list_vocabularies)
         call_tool_result = await self.create_response(db_result, db_error)
         if call_tool_result.isError:
@@ -266,6 +266,27 @@ class DrupalListParagraphsByNodeIdTool(DrupalBaseTool):
             raise Exception(f"Tool {self.name} failed with an unknown error.")
         return call_tool_result.content
 
+class DrupalListParagraphTypesFieldsTool(DrupalBaseTool):
+    def __init__(self, db_manager: DBManager):
+        super().__init__(
+            name="drupal_list_paragraph_types_fields",
+            description="Lists all paragraph types and their defined fields (name, type, required status, and settings).",
+            input_schema={"type": "object", "properties": {"random_string": {"type": "string", "description": "A dummy string argument."}}, "required": ["random_string"]},
+            db_manager=db_manager
+        )
+
+    async def __call__(self, random_string: str = "DEFAULT_VALUE_FOR_DIAGNOSIS") -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        logger.info(f"Executing tool: {self.name} with random_string: '{random_string}' (Note: This might be a default if input was empty at validation)")
+        
+        db_result, db_error = await self.handle_db_call(self.db_manager.list_paragraph_types_with_fields)
+        
+        call_tool_result = await self.create_response(db_result, db_error)
+        if call_tool_result.isError:
+            if call_tool_result.content and isinstance(call_tool_result.content[0], TextContent):
+                raise Exception(call_tool_result.content[0].text)
+            raise Exception(f"Tool {self.name} failed with an unknown error.")
+        return call_tool_result.content
+
 class DrupalDatabaseQueryTool(DrupalBaseTool):
     def __init__(self, db_manager: DBManager):
         super().__init__(
@@ -276,8 +297,8 @@ class DrupalDatabaseQueryTool(DrupalBaseTool):
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "The action to perform: 'list_tables', 'get_table_schema', or 'execute_sql'.",
-                        "enum": ["list_tables", "get_table_schema", "execute_sql"]
+                        "description": "The action to perform: 'list_tables', 'get_table_schema', 'execute_sql', or 'search_all_tables'.",
+                        "enum": ["list_tables", "get_table_schema", "execute_sql", "search_all_tables"]
                     },
                     "table_name": {
                         "type": "string",
@@ -291,6 +312,14 @@ class DrupalDatabaseQueryTool(DrupalBaseTool):
                         "type": "array",
                         "description": "A list of parameters for the SQL query (for 'execute_sql', used in placeholders like %s).",
                         "items": {"type": "string"} # Assuming params are strings, can be more generic if needed
+                    },
+                    "search_string": {
+                        "type": "string",
+                        "description": "The string to search for when action is 'search_all_tables'."
+                    },
+                    "row_limit_per_column": {
+                        "type": "integer",
+                        "description": "Maximum number of rows to return per column match for 'search_all_tables' action. Defaults to 5."
                     }
                 },
                 "required": ["action"]
@@ -298,13 +327,15 @@ class DrupalDatabaseQueryTool(DrupalBaseTool):
             db_manager=db_manager
         )
 
-    async def __call__(self, arguments: dict[str, Any]) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-        action = arguments.get('action')
-        table_name = arguments.get('table_name')
-        sql_query = arguments.get('sql_query')
-        query_params = arguments.get('query_params')
-
-        logger.info(f"Executing tool: {self.name} with action: {action}, table_name: {table_name}, sql_query: {sql_query is not None}, query_params: {query_params is not None}")
+    async def __call__(self, 
+                       action: str, 
+                       table_name: Optional[str] = None, 
+                       sql_query: Optional[str] = None, 
+                       query_params: Optional[List[str]] = None,
+                       search_string: Optional[str] = None,
+                       row_limit_per_column: Optional[int] = None) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        
+        logger.info(f"Executing tool: {self.name} with action: {action}, table_name: {table_name}, sql_query: {sql_query is not None}, query_params: {query_params is not None}, search_string: {search_string is not None}")
 
         result = None
         error_message = None
@@ -339,6 +370,12 @@ class DrupalDatabaseQueryTool(DrupalBaseTool):
                         result = {"message": "Query executed successfully.", "rows_affected_or_matched": self.db_manager.cursor.rowcount}
                     else:
                         result = {"message": "Query executed. No results returned or an error occurred (check server logs if expecting data)."}
+        elif action == 'search_all_tables':
+            if not search_string:
+                error_message = "'search_string' is required for 'search_all_tables' action."
+            else:
+                limit = row_limit_per_column if row_limit_per_column is not None else 5
+                result, error_message = await self.handle_db_call(self.db_manager.search_string_in_all_tables, search_string, limit)
         else:
             error_message = f"Unknown action: {action}"
 
@@ -538,6 +575,7 @@ async def main():
     get_term_by_id_tool = DrupalGetTaxonomyTermByIdTool(db_manager=db_manager_instance)
     get_user_by_id_tool = DrupalGetUserByIdTool(db_manager=db_manager_instance)
     list_paragraphs_tool = DrupalListParagraphsByNodeIdTool(db_manager=db_manager_instance)
+    list_paragraph_types_fields_tool = DrupalListParagraphTypesFieldsTool(db_manager=db_manager_instance)
 
     all_tools_objects = [
         drupal_query_tool,
@@ -546,7 +584,8 @@ async def main():
         list_vocabularies_tool,
         get_term_by_id_tool,
         get_user_by_id_tool,
-        list_paragraphs_tool
+        list_paragraphs_tool,
+        list_paragraph_types_fields_tool
     ]
     
     # Register tools using the server's add_tool method and then try to override schema
@@ -559,7 +598,7 @@ async def main():
             # Register the tool using server.add_tool.
             # This will infer a basic schema from tool_obj.__call__(self, arguments: dict).
             server.add_tool(
-                fn=tool_obj.__call__, 
+                fn=tool_obj.__call__,
                 name=tool_obj.name,
                 description=tool_obj.description
             )
@@ -569,8 +608,17 @@ async def main():
             registered_tool_handler = server._tool_manager._tools.get(tool_obj.name)
             if registered_tool_handler:
                 if hasattr(registered_tool_handler, 'parameters'):
-                    logger.info(f"Overriding schema for tool: {tool_obj.name}")
-                    registered_tool_handler.parameters = tool_obj.inputSchema
+                    # Check the signature of the __call__ method
+                    call_signature = inspect.signature(tool_obj.__call__)
+                    # Parameters count includes 'self'. So 2 means 'self' and one other argument.
+                    if len(call_signature.parameters) == 2 and list(call_signature.parameters.keys())[0] == 'self':
+                        # If the __call__ method takes exactly one argument (plus self),
+                        # it's safer to rely on FastMCP's inferred schema from this direct signature
+                        # to avoid potential mismatches in parameter extraction vs. validation.
+                        logger.info(f"Relying on inferred schema for single-argument tool: {tool_obj.name}")
+                    else:
+                        logger.info(f"Overriding schema for tool: {tool_obj.name} with inputSchema: {tool_obj.inputSchema}")
+                        registered_tool_handler.parameters = tool_obj.inputSchema
                 else:
                     logger.warning(f"Registered tool {tool_obj.name} does not have 'parameters' attribute to override schema.")
             else:
