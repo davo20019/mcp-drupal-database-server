@@ -1,7 +1,7 @@
 import mysql.connector
 import psycopg2
-import pyodbc  # Added for SQL Server
-import cx_Oracle # Added for Oracle
+# import pyodbc  # Added for SQL Server
+# import cx_Oracle # Added for Oracle
 import logging
 from typing import List, Dict, Any, Optional
 import re
